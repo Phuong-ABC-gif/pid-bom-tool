@@ -291,11 +291,14 @@ def flatten_bom(groups: dict) -> list:
                 })
 
             # Sort items by desc
-            items = sorted(groups[sec][subsec].keys(), key=lambda x: x[0])
+            items = sorted(groups[sec][subsec].items(), key=lambda x: x[0][0])
             item_letter_idx = 0
             LETTERS = "abcdefghijklmnopqrstuvwxyz"
 
-            for (desc, code, mat, std, unit), sizes in items:
+            for key, sizes in items:
+                if not isinstance(key, tuple) or len(key) != 5:
+                    continue
+                desc, code, mat, std, unit = key
                 for size, count in sorted(sizes.items(), key=lambda x: x[0]):
                     ltr = LETTERS[item_letter_idx % 26] if item_letter_idx < 26 else \
                           LETTERS[item_letter_idx // 26 - 1] + LETTERS[item_letter_idx % 26]
