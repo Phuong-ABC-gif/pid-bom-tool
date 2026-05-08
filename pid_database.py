@@ -97,7 +97,7 @@ _SPX_RAW = [
      _eq("Butterfly Valve Thinktop (Sanitary)", "BFV-TK", "SS316L", "SMS", "EA", "sanitary", "process")),
     (r'\bBFV.?A\b|BUTTERFLY.*ACTUATOR|BUTTERFLY.*AIR.*ACT',
      _eq("Butterfly Valve Actuator (Sanitary)", "BFV-A",  "SS316L", "SMS", "EA", "sanitary", "process")),
-    (r'\bBFV.?M\b|BUTTERFLY.*MANUAL',
+    (r'\bBFV.?M\b|BUTTERFLY.*MANUAL|MANUAL.*BUTTERFLY',
      _eq("Butterfly Valve Manual (Sanitary)",   "BFV-M",  "SS316L", "SMS", "EA", "sanitary", "process")),
 
     # ── Sanitary Component ────────────────────────────────────────────────────
@@ -167,7 +167,7 @@ _SPX_RAW = [
      _eq("Globe Valve Modulating",     "GV-LC",  "Cast Iron", "Industry", "EA", "utility", "chiller")),
     (r'\bBV.?A\b|BALL.*ACTUATOR',
      _eq("Ball Valve Actuator",        "BV-A",   "Brass",     "Industry", "EA", "utility", "chiller")),
-    (r'\bBV.?M\b|BALL.*MANUAL',
+    (r'\bBV.?M\b|BALL.*MANUAL|MANUAL.*BALL',
      _eq("Ball Valve Manual",          "BV-M",   "Brass",     "Industry", "EA", "utility", "chiller")),
     (r'\bBV.?S\b|BALL.*SOLENOID',
      _eq("Ball Valve Solenoid",        "BV-S",   "Brass",     "Industry", "EA", "utility", "chiller")),
@@ -314,7 +314,7 @@ _TPV_RAW = [
      _eq("Butterfly Valve Thinktop (Sanitary)", "BFV-TK", "SS316L", "SMS", "EA", "sanitary", "process")),
     (r'\bBFV.?A\b(?!.*UTIL)|BUTTERFLY.*ACTUATOR(?!.*UTIL)',
      _eq("Butterfly Valve Actuator (Sanitary)", "BFV-A",  "SS316L", "SMS", "EA", "sanitary", "process")),
-    (r'\bBFV.?M\b(?!.*UTIL)|BUTTERFLY.*MANUAL(?!.*UTIL)',
+    (r'\bBFV.?M\b|BUTTERFLY.*MANUAL|MANUAL.*BUTTERFLY',
      _eq("Butterfly Valve Manual (Sanitary)",   "BFV-M",  "SS316L", "SMS", "EA", "sanitary", "process")),
 
     # ── Constant Pressure Valve ───────────────────────────────────────────────
@@ -384,7 +384,7 @@ _TPV_RAW = [
      _eq("Globe Valve Manual",       "GV-M",  "Cast Iron", "Industry", "EA", "utility", "chiller")),
     (r'\bBV.?A\b|BALL.*ACTUATOR',
      _eq("Ball Valve Actuator",      "BV-A",  "Brass",     "Industry", "EA", "utility", "chiller")),
-    (r'\bBV.?M\b|BALL.*MANUAL',
+    (r'\bBV.?M\b|BALL.*MANUAL|MANUAL.*BALL',
      _eq("Ball Valve Manual",        "BV-M",  "Brass",     "Industry", "EA", "utility", "chiller")),
     (r'\bBFV.?UA\b|BUTTERFLY.*UTIL.*ACT',
      _eq("Butterfly Valve Actuator (Utility)", "BFV-UA", "Cast Iron/Disc SS304", "JIS10K", "EA", "utility", "chiller")),

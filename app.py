@@ -192,9 +192,27 @@ def parse_dxf(file_bytes: bytes, skill_key: str, max_dist: float):
                 "y": eq["y"],
                 "size":  size,
                 "info":  info,
+                "is_unknown": False,
             })
         else:
+            # Fallback: dùng tên block làm tên thiết bị, vào section "unknown"
             unknown_blocks[eq["name"]] += 1
+            equipment_list.append({
+                "block_name": eq["name"],
+                "x": eq["x"],
+                "y": eq["y"],
+                "size": size,
+                "info": {
+                    "desc":       eq["name"],   # tên block = tên thiết bị
+                    "code":       eq["name"],
+                    "material":   "",
+                    "standard":   "",
+                    "unit":       "EA",
+                    "section":    "unknown",
+                    "subsection": "",
+                },
+                "is_unknown": True,
+            })
 
     return equipment_list, dict(unknown_blocks), size_annotations, errors
 
@@ -214,7 +232,7 @@ def find_nearest_size(ex: float, ey: float, size_texts: list, max_dist: float) -
 # ─────────────────────────────────────────────────────────────────────────────
 # BOM BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
-SECTION_ORDER = ["sanitary", "utility", "steam", "instrument"]
+SECTION_ORDER = ["sanitary", "utility", "steam", "instrument", "unknown"]
 SUBSECTION_LABELS = {
     "process":    "Đường Product / CIP / Process Water",
     "chiller":    "Đường Chiller (Ice Water)",
@@ -227,6 +245,7 @@ SECTION_LABELS = {
     "utility":    "Thiết bị Công Nghiệp (Utility)",
     "steam":      "Thiết bị Đường Hơi (Steam)",
     "instrument": "Thiết bị Đo Lường (Instrument)",
+    "unknown":    "Thiết bị Chưa Phân Loại (Cần Kiểm Tra)",
 }
 
 
@@ -381,9 +400,10 @@ def export_excel(bom_rows: list, project_name: str, drawing_no: str, skill_key: 
         if rtype == "section":
             ws.cell(r, 1, row_dict["stt"])
             ws.cell(r, 2, row_dict["mo_ta"])
+            sec_clr = "FFE0B2" if "Chưa Phân Loại" in str(row_dict.get("mo_ta","")) else CLR_SECTION
             for ci in range(1, 11):
                 c = ws.cell(r, ci)
-                c.fill = _fill(CLR_SECTION)
+                c.fill = _fill(sec_clr)
                 c.font = _font(bold=True)
                 c.alignment = Alignment(horizontal="left" if ci == 2 else "center",
                                         vertical="center")
@@ -643,11 +663,12 @@ if uploaded:
 
     with tab_unknown:
         if unknown_blocks:
-            st.markdown('<div class="warn-box">⚠️ Các block dưới đây chưa có trong database. '
-                        'Kiểm tra tên block trong DXF hoặc cập nhật <code>pid_database.py</code>.</div>',
+            st.markdown('<div class="warn-box">⚠️ Các block dưới đây chưa có trong database — '
+                        '<b>đã tự động đưa vào BOM</b> dùng tên block làm tên thiết bị. '
+                        'Cập nhật <code>pid_database.py</code> để phân loại chính xác hơn.</div>',
                         unsafe_allow_html=True)
             df_unk = pd.DataFrame([
-                {"Block Name": k, "Số lần xuất hiện": v}
+                {"Block Name": k, "Số lần xuất hiện": v, "Xử lý": "✅ Đã đưa vào BOM (tên block = tên thiết bị)"}
                 for k, v in sorted(unknown_blocks.items(), key=lambda x: -x[1])
             ])
             st.dataframe(df_unk, use_container_width=True, hide_index=True)
