@@ -26,7 +26,7 @@ IGNORE_BLOCKS = {
     "north arrow", "scale bar", "flow_arrow",
 }
 
-MAX_DIST = 300  # DXF units — proximity radius for size detection
+MAX_DIST = 50  # DXF units — proximity radius for size detection
 
 # ───── COLOUR CONSTANTS ─────
 BG_CYAN   = PatternFill("solid", start_color="00FFFF", end_color="00FFFF")
