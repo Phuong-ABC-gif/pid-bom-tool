@@ -1,1182 +1,815 @@
 """
-P&ID BOM Generator — SPX + Tetra Pak (ANH MINH 2021)
-Tuân thủ: pid-reader-spx + pid-reader-tetrapak SKILL.md
-Tác giả: Tự động sinh từ skill rules
+PID BOM Extractor — SPX / Tetra Pak
+Anh Minh 2021 Standard
+Rule-based, no AI cost, reads block names from DXF.
 """
 
-import streamlit as st
-import ezdxf
+import io
 import math
 import re
-import io
+import tempfile
 from collections import defaultdict
-from datetime import date
+
+import ezdxf
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+import pandas as pd
+import streamlit as st
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. CONSTANTS & LOOKUP TABLES
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════
 
-# Blocks chắc chắn không phải thiết bị → bỏ qua khi scan INSERT
-IGNORE_BLOCK_KEYWORDS = {
-    'linenamettpleft', 'linenametpvleft', 'linenametpleft',
-    'linename', 'flow arrow', 'flowarrow', 'pid', 'north arrow',
-    'title block', 'titleblock', 'revision', 'border', 'frame',
-    'legend', 'notes', 'objects', 'viewport'
+IGNORE_BLOCKS = {
+    "flow arrow", "linenametpleft", "linenametpright",
+    "pid", "objects", "title block", "revision", "border",
+    "north arrow", "scale bar", "flow_arrow",
 }
 
-# Tên block chứa keyword nào → block đó là LINENAME (cần đọc attribute)
-LINENAME_BLOCK_KEYWORDS = {
-    'linename', 'linenamettpleft', 'linenametpvleft', 'linenametpleft',
-    'tpleft', 'tpvleft', 'line name', 'linenum'
+MAX_DIST = 300  # DXF units — proximity radius for size detection
+
+# ───── COLOUR CONSTANTS ─────
+BG_CYAN   = PatternFill("solid", start_color="00FFFF", end_color="00FFFF")
+BG_YELLOW = PatternFill("solid", start_color="FFFF00", end_color="FFFF00")
+BG_WHITE  = PatternFill("solid", start_color="FFFFFF", end_color="FFFFFF")
+RED       = "FF0000"
+BLACK     = "000000"
+BLUE      = "003399"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  EQUIPMENT LIBRARY  (block-name → display info)
+# ═══════════════════════════════════════════════════════════════════
+
+# fmt: off
+# Each entry:
+#   key   = canonical name (lowercase, words only — used for matching)
+#   value = dict with MO_TA, CHUNG_LOAI, VAT_LIEU, TIEU_CHUAN, DON_VI, SECTION
+#           SECTION: "sanitary" | "ice_water" | "cooling" | "steam" | "air" | "instrument" | "equipment"
+
+SPX_LIBRARY = {
+    # ── SINGLE SEAT VALVE ──────────────────────────────────────────
+    "ssv 200 sv41 l manual":           {"mo_ta":"Single Seat Valve 200 (SV41-L) – Manual",         "chung_loai":"Manual",     "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 200 sv41 l actuator":         {"mo_ta":"Single Seat Valve 200 (SV41-L) – Actuator NC",    "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 200 sv41 l thinktop":         {"mo_ta":"Single Seat Valve 200 (SV41-L) – Thinktop",       "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 200 nc sw41 l thinktop":      {"mo_ta":"Single Seat Valve 200 (SV41-L) – Thinktop NC",    "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 200 nc sw41 l actuator":      {"mo_ta":"Single Seat Valve 200 (SV41-L) – Actuator NC",    "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 200 manual":                  {"mo_ta":"Single Seat Valve 200 – Manual",                  "chung_loai":"Manual",     "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 200 actuator":                {"mo_ta":"Single Seat Valve 200 – Actuator NC",              "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 200 thinktop":                {"mo_ta":"Single Seat Valve 200 – Thinktop",                 "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 200 nc air actuator":         {"mo_ta":"Single Seat Valve 200 – Air Actuator NC",          "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 200 no air actuator":         {"mo_ta":"Single Seat Valve 200 – Air Actuator NO",          "chung_loai":"Actuator NO","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+
+    "ssv 210 sv43 ll manual":          {"mo_ta":"Single Seat Valve 210 (SV43-LL) – Manual",        "chung_loai":"Manual",     "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 210 sv43 ll actuator":        {"mo_ta":"Single Seat Valve 210 (SV43-LL) – Actuator NC",   "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 210 sv43 ll thinktop":        {"mo_ta":"Single Seat Valve 210 (SV43-LL) – Thinktop",      "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 210 manual":                  {"mo_ta":"Single Seat Valve 210 – Manual",                  "chung_loai":"Manual",     "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 210 actuator":                {"mo_ta":"Single Seat Valve 210 – Actuator NC",              "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 210 thinktop":                {"mo_ta":"Single Seat Valve 210 – Thinktop",                 "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 210 nc air actuator":         {"mo_ta":"Single Seat Valve 210 – Air Actuator NC",          "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 210 no air actuator":         {"mo_ta":"Single Seat Valve 210 – Air Actuator NO",          "chung_loai":"Actuator NO","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 210 no n air actuator":       {"mo_ta":"Single Seat Valve 210 – Air Actuator NO-N",        "chung_loai":"Actuator NO","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+
+    "ssv 220 sv44 tl manual":          {"mo_ta":"Single Seat Valve 220 (SV44-TL) – Manual",        "chung_loai":"Manual",     "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 220 sv44 tl actuator":        {"mo_ta":"Single Seat Valve 220 (SV44-TL) – Actuator NC",   "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 220 sv44 tl thinktop":        {"mo_ta":"Single Seat Valve 220 (SV44-TL) – Thinktop",      "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 220 manual":                  {"mo_ta":"Single Seat Valve 220 – Manual",                  "chung_loai":"Manual",     "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 220 actuator":                {"mo_ta":"Single Seat Valve 220 – Actuator NC",              "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 220 thinktop":                {"mo_ta":"Single Seat Valve 220 – Thinktop",                 "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+
+    "ssv 300 sv42 t manual":           {"mo_ta":"Single Seat Valve 300 (SV42-T) – Manual",         "chung_loai":"Manual",     "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 300 sv42 t actuator":         {"mo_ta":"Single Seat Valve 300 (SV42-T) – Actuator NC",    "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 300 sv42 t thinktop":         {"mo_ta":"Single Seat Valve 300 (SV42-T) – Thinktop",       "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 300 manual":                  {"mo_ta":"Single Seat Valve 300 – Manual",                  "chung_loai":"Manual",     "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 300 actuator":                {"mo_ta":"Single Seat Valve 300 – Actuator NC",              "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 300 thinktop":                {"mo_ta":"Single Seat Valve 300 – Thinktop",                 "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+
+    # ── MIXPROOF VALVE ─────────────────────────────────────────────
+    "mixproof valve actuator":         {"mo_ta":"Mixproof Valve – Actuator NC",                    "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "mixproof valve thinktop":         {"mo_ta":"Mixproof Valve – Thinktop",                       "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "mixproof valve nc solenoid":      {"mo_ta":"Mixproof Valve NC – Solenoid",                    "chung_loai":"Solenoid",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "mpv actuator":                    {"mo_ta":"Mixproof Valve – Actuator NC",                    "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "mpv thinktop":                    {"mo_ta":"Mixproof Valve – Thinktop",                       "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+
+    # ── BUTTERFLY VALVE SANITARY ───────────────────────────────────
+    "butterfly valve manual":          {"mo_ta":"Butterfly Valve – Manual",                        "chung_loai":"Manual",     "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "butterfly valve actuator":        {"mo_ta":"Butterfly Valve – Actuator NC",                   "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "butterfly valve thinktop":        {"mo_ta":"Butterfly Valve – Thinktop",                      "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "butterfly valve nc air actuator": {"mo_ta":"Butterfly Valve NC – Air Actuator",               "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "butterfly valve no air actuator": {"mo_ta":"Butterfly Valve NO – Air Actuator",               "chung_loai":"Actuator NO","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "bfv manual":                      {"mo_ta":"Butterfly Valve – Manual",                        "chung_loai":"Manual",     "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "bfv actuator":                    {"mo_ta":"Butterfly Valve – Actuator NC",                   "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "bfv thinktop":                    {"mo_ta":"Butterfly Valve – Thinktop",                      "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "bfv tk":                          {"mo_ta":"Butterfly Valve – Thinktop",                      "chung_loai":"Thinktop",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+
+    # ── SANITARY COMPONENTS ────────────────────────────────────────
+    "non return valve":                {"mo_ta":"Non-Return Valve",                                "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "nrv":                             {"mo_ta":"Non-Return Valve",                                "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "sight glass":                     {"mo_ta":"Sight Glass",                                     "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"set","section":"sanitary"},
+    "sg":                              {"mo_ta":"Sight Glass",                                     "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"set","section":"sanitary"},
+    "sampling valve actuator":         {"mo_ta":"Sampling Valve – Actuator",                       "chung_loai":"Actuator",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "sampling valve manual":           {"mo_ta":"Sampling Valve – Manual",                         "chung_loai":"Manual",     "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "sva":                             {"mo_ta":"Sampling Valve – Actuator",                       "chung_loai":"Actuator",   "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "svm":                             {"mo_ta":"Sampling Valve – Manual",                         "chung_loai":"Manual",     "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "constant pressure valve":         {"mo_ta":"Constant Pressure Valve",                         "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "cpv":                             {"mo_ta":"Constant Pressure Valve",                         "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "sterile filter":                  {"mo_ta":"Sterile Filter",                                  "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "sf":                              {"mo_ta":"Sterile Filter",                                  "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "inline filter fsh":               {"mo_ta":"Inline Filter FSH",                               "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "inline filter fsr":               {"mo_ta":"Inline Filter FSR",                               "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "fsh":                             {"mo_ta":"Inline Filter FSH",                               "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "fsr":                             {"mo_ta":"Inline Filter FSR",                               "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "plate heat exchanger":            {"mo_ta":"Plate Heat Exchanger",                            "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"set","section":"sanitary"},
+    "phe":                             {"mo_ta":"Plate Heat Exchanger",                            "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"set","section":"sanitary"},
+    "tubular heat exchanger":          {"mo_ta":"Tubular Heat Exchanger",                          "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"set","section":"sanitary"},
+    "the":                             {"mo_ta":"Tubular Heat Exchanger",                          "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"set","section":"sanitary"},
+    "flexible hose":                   {"mo_ta":"Flexible Hose",                                   "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "fh":                              {"mo_ta":"Flexible Hose",                                   "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+
+    # ── PUMPS SANITARY ─────────────────────────────────────────────
+    "centrifugal pump w+":             {"mo_ta":"Centrifugal Pump W+",                             "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "centrifugal pump ws+":            {"mo_ta":"Centrifugal Pump WS+",                            "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "cp w+":                           {"mo_ta":"Centrifugal Pump W+",                             "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "cp ws+":                          {"mo_ta":"Centrifugal Pump WS+",                            "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "lobe pump dw+":                   {"mo_ta":"Lobe Pump DW+",                                   "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "lp dw+":                          {"mo_ta":"Lobe Pump DW+",                                   "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "peristaltic pump":                {"mo_ta":"Peristaltic Pump",                                "chung_loai":"-",          "vat_lieu":"-",     "tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "prp":                             {"mo_ta":"Peristaltic Pump",                                "chung_loai":"-",          "vat_lieu":"-",     "tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "liquid ring pump":                {"mo_ta":"Liquid Ring Pump",                                "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"-",  "don_vi":"pcs","section":"sanitary"},
+    "lrp":                             {"mo_ta":"Liquid Ring Pump",                                "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"-",  "don_vi":"pcs","section":"sanitary"},
+    "vane pump":                       {"mo_ta":"Vane Pump",                                       "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"-",  "don_vi":"pcs","section":"sanitary"},
+    "vp":                              {"mo_ta":"Vane Pump",                                       "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"-",  "don_vi":"pcs","section":"sanitary"},
+    "vacuum pump":                     {"mo_ta":"Vacuum Pump",                                     "chung_loai":"-",          "vat_lieu":"-",     "tieu_chuan":"-",  "don_vi":"pcs","section":"sanitary"},
+    "vac":                             {"mo_ta":"Vacuum Pump",                                     "chung_loai":"-",          "vat_lieu":"-",     "tieu_chuan":"-",  "don_vi":"pcs","section":"sanitary"},
+    "compressor":                      {"mo_ta":"Compressor",                                      "chung_loai":"-",          "vat_lieu":"-",     "tieu_chuan":"-",  "don_vi":"pcs","section":"sanitary"},
+    "comp":                            {"mo_ta":"Compressor",                                      "chung_loai":"-",          "vat_lieu":"-",     "tieu_chuan":"-",  "don_vi":"pcs","section":"sanitary"},
+    "blower":                          {"mo_ta":"Blower / Fan",                                    "chung_loai":"-",          "vat_lieu":"-",     "tieu_chuan":"-",  "don_vi":"pcs","section":"sanitary"},
+    "blw":                             {"mo_ta":"Blower / Fan",                                    "chung_loai":"-",          "vat_lieu":"-",     "tieu_chuan":"-",  "don_vi":"pcs","section":"sanitary"},
+
+    # ── UTILITY VALVE MANUAL ───────────────────────────────────────
+    "globe valve manual":              {"mo_ta":"Globe Valve – Manual",                            "chung_loai":"Manual",     "vat_lieu":"Cast Iron","tieu_chuan":"Thread end","don_vi":"pcs","section":"steam"},
+    "gv m":                            {"mo_ta":"Globe Valve – Manual",                            "chung_loai":"Manual",     "vat_lieu":"Cast Iron","tieu_chuan":"Thread end","don_vi":"pcs","section":"steam"},
+    "ball valve manual":               {"mo_ta":"Ball Valve – Manual",                             "chung_loai":"Manual",     "vat_lieu":"Brass",    "tieu_chuan":"Thread end","don_vi":"pcs","section":"ice_water"},
+    "bv m":                            {"mo_ta":"Ball Valve – Manual",                             "chung_loai":"Manual",     "vat_lieu":"Brass",    "tieu_chuan":"Thread end","don_vi":"pcs","section":"ice_water"},
+    "butterfly valve manual utility":  {"mo_ta":"Butterfly Valve (Utility) – Manual",              "chung_loai":"Manual",     "vat_lieu":"Cast Iron / Disc SS304","tieu_chuan":"JIS10K","don_vi":"pcs","section":"ice_water"},
+    "bfv um":                          {"mo_ta":"Butterfly Valve (Utility) – Manual",              "chung_loai":"Manual",     "vat_lieu":"Cast Iron / Disc SS304","tieu_chuan":"JIS10K","don_vi":"pcs","section":"ice_water"},
+    "diaphragm valve manual":          {"mo_ta":"Diaphragm Valve – Manual",                       "chung_loai":"Manual",     "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "dv m":                            {"mo_ta":"Diaphragm Valve – Manual",                       "chung_loai":"Manual",     "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "angle valve manual":              {"mo_ta":"Angle Valve – Manual",                            "chung_loai":"Manual",     "vat_lieu":"SS304",   "tieu_chuan":"Thread end","don_vi":"pcs","section":"air"},
+    "av m":                            {"mo_ta":"Angle Valve – Manual",                            "chung_loai":"Manual",     "vat_lieu":"SS304",   "tieu_chuan":"Thread end","don_vi":"pcs","section":"air"},
+
+    # ── UTILITY VALVE ACTUATOR ─────────────────────────────────────
+    "globe valve actuator":            {"mo_ta":"Globe Valve – Actuator NC",                       "chung_loai":"Actuator NC","vat_lieu":"Cast Iron","tieu_chuan":"Thread end","don_vi":"pcs","section":"steam"},
+    "gv a":                            {"mo_ta":"Globe Valve – Actuator NC",                       "chung_loai":"Actuator NC","vat_lieu":"Cast Iron","tieu_chuan":"Thread end","don_vi":"pcs","section":"steam"},
+    "ball valve actuator":             {"mo_ta":"Ball Valve – Actuator NC",                        "chung_loai":"Actuator NC","vat_lieu":"Brass",    "tieu_chuan":"Thread end","don_vi":"pcs","section":"ice_water"},
+    "bv a":                            {"mo_ta":"Ball Valve – Actuator NC",                        "chung_loai":"Actuator NC","vat_lieu":"Brass",    "tieu_chuan":"Thread end","don_vi":"pcs","section":"ice_water"},
+    "butterfly valve actuator utility":{"mo_ta":"Butterfly Valve (Utility) – Actuator NC",         "chung_loai":"Actuator NC","vat_lieu":"Cast Iron / Disc SS304","tieu_chuan":"JIS10K","don_vi":"pcs","section":"ice_water"},
+    "bfv ua":                          {"mo_ta":"Butterfly Valve (Utility) – Actuator NC",         "chung_loai":"Actuator NC","vat_lieu":"Cast Iron / Disc SS304","tieu_chuan":"JIS10K","don_vi":"pcs","section":"ice_water"},
+    "angle seat valve actuator":       {"mo_ta":"Angle Seat Valve – Actuator NC",                  "chung_loai":"Actuator NC","vat_lieu":"SS304",   "tieu_chuan":"Thread end","don_vi":"pcs","section":"steam"},
+    "asv a":                           {"mo_ta":"Angle Seat Valve – Actuator NC",                  "chung_loai":"Actuator NC","vat_lieu":"SS304",   "tieu_chuan":"Thread end","don_vi":"pcs","section":"steam"},
+    "diaphragm valve actuator":        {"mo_ta":"Diaphragm Valve – Actuator NC",                   "chung_loai":"Actuator NC","vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "dv a":                            {"mo_ta":"Diaphragm Valve – Actuator NC",                   "chung_loai":"Actuator NC","vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+
+    # ── UTILITY VALVE SOLENOID ─────────────────────────────────────
+    "globe valve solenoid":            {"mo_ta":"Globe Valve – Solenoid",                          "chung_loai":"Solenoid",   "vat_lieu":"Cast Iron","tieu_chuan":"Thread end","don_vi":"pcs","section":"steam"},
+    "ball valve solenoid":             {"mo_ta":"Ball Valve – Solenoid",                           "chung_loai":"Solenoid",   "vat_lieu":"Brass",    "tieu_chuan":"Thread end","don_vi":"pcs","section":"ice_water"},
+    "angle seat valve solenoid":       {"mo_ta":"Angle Seat Valve – Solenoid",                     "chung_loai":"Solenoid",   "vat_lieu":"SS304",   "tieu_chuan":"Thread end","don_vi":"pcs","section":"steam"},
+    "asv s":                           {"mo_ta":"Angle Seat Valve – Solenoid",                     "chung_loai":"Solenoid",   "vat_lieu":"SS304",   "tieu_chuan":"Thread end","don_vi":"pcs","section":"steam"},
+
+    # ── UTILITY VALVE MODULATING ───────────────────────────────────
+    "globe valve linear control":      {"mo_ta":"Globe Valve – Linear Control (Modulating)",       "chung_loai":"Pneumatic modulating","vat_lieu":"Cast Iron","tieu_chuan":"PN16","don_vi":"pcs","section":"steam"},
+    "butterfly valve linear control":  {"mo_ta":"Butterfly Valve – Linear Control (Modulating)",   "chung_loai":"Pneumatic modulating","vat_lieu":"Cast Iron / Disc SS304","tieu_chuan":"JIS10K","don_vi":"pcs","section":"ice_water"},
+
+    # ── SPECIAL VALVES ─────────────────────────────────────────────
+    "check valve":                     {"mo_ta":"Check Valve",                                     "chung_loai":"-",          "vat_lieu":"Cast Iron","tieu_chuan":"PN16","don_vi":"pcs","section":"ice_water"},
+    "cv":                              {"mo_ta":"Check Valve",                                     "chung_loai":"-",          "vat_lieu":"Cast Iron","tieu_chuan":"PN16","don_vi":"pcs","section":"ice_water"},
+    "constant valve":                  {"mo_ta":"Constant Valve (CSTV)",                           "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"Thread end","don_vi":"pcs","section":"air"},
+    "cstv":                            {"mo_ta":"Constant Valve (CSTV)",                           "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"Thread end","don_vi":"pcs","section":"air"},
+    "reducing pressure valve":         {"mo_ta":"Reducing Pressure Valve",                         "chung_loai":"-",          "vat_lieu":"Cast Iron","tieu_chuan":"PN16","don_vi":"pcs","section":"steam"},
+    "rpv":                             {"mo_ta":"Reducing Pressure Valve",                         "chung_loai":"-",          "vat_lieu":"Cast Iron","tieu_chuan":"PN16","don_vi":"pcs","section":"steam"},
+    "air relief valve":                {"mo_ta":"Air Relief Valve",                                "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "arv":                             {"mo_ta":"Air Relief Valve",                                "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "vacuum relief valve":             {"mo_ta":"Vacuum Relief Valve",                             "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"-","don_vi":"pcs","section":"sanitary"},
+    "vrv":                             {"mo_ta":"Vacuum Relief Valve",                             "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"-","don_vi":"pcs","section":"sanitary"},
+    "pressure relief valve":           {"mo_ta":"Pressure Relief Valve",                           "chung_loai":"-",          "vat_lieu":"Brass",   "tieu_chuan":"Thread end","don_vi":"pcs","section":"steam"},
+    "prv":                             {"mo_ta":"Pressure Relief Valve",                           "chung_loai":"-",          "vat_lieu":"Brass",   "tieu_chuan":"Thread end","don_vi":"pcs","section":"steam"},
+
+    # ── UTILITY COMPONENTS ─────────────────────────────────────────
+    "steam trap":                      {"mo_ta":"Float Steam Trap",                                "chung_loai":"-",          "vat_lieu":"Cast Iron","tieu_chuan":"PN16","don_vi":"pcs","section":"steam"},
+    "st":                              {"mo_ta":"Float Steam Trap",                                "chung_loai":"-",          "vat_lieu":"Cast Iron","tieu_chuan":"PN16","don_vi":"pcs","section":"steam"},
+    "y strainer":                      {"mo_ta":"Y Strainer",                                      "chung_loai":"-",          "vat_lieu":"Cast Iron","tieu_chuan":"JIS10K","don_vi":"pcs","section":"ice_water"},
+    "ys":                              {"mo_ta":"Y Strainer",                                      "chung_loai":"-",          "vat_lieu":"Cast Iron","tieu_chuan":"JIS10K","don_vi":"pcs","section":"ice_water"},
+    "expansion vessel":                {"mo_ta":"Expansion Vessel",                                "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"Industry","don_vi":"set","section":"ice_water"},
+    "ev":                              {"mo_ta":"Expansion Vessel",                                "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"Industry","don_vi":"set","section":"ice_water"},
+    "syphon 180":                      {"mo_ta":"Syphon 180°",                                     "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"Industry","don_vi":"pcs","section":"steam"},
+    "sy180":                           {"mo_ta":"Syphon 180°",                                     "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"Industry","don_vi":"pcs","section":"steam"},
+    "syphon 90":                       {"mo_ta":"Syphon 90°",                                      "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"Industry","don_vi":"pcs","section":"steam"},
+    "sy90":                            {"mo_ta":"Syphon 90°",                                      "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"Industry","don_vi":"pcs","section":"steam"},
+    "expansion joint":                 {"mo_ta":"Expansion Joint",                                 "chung_loai":"-",          "vat_lieu":"-",       "tieu_chuan":"-","don_vi":"pcs","section":"ice_water"},
+    "ej":                              {"mo_ta":"Expansion Joint",                                 "chung_loai":"-",          "vat_lieu":"-",       "tieu_chuan":"-","don_vi":"pcs","section":"ice_water"},
+
+    # ── INSTRUMENTS ────────────────────────────────────────────────
+    "flow meter":                      {"mo_ta":"Flow Meter",                                      "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"pcs","section":"instrument"},
+    "fm":                              {"mo_ta":"Flow Meter",                                      "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"pcs","section":"instrument"},
+    "temperature transmitter":         {"mo_ta":"Temperature Transmitter",                         "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "tt":                              {"mo_ta":"Temperature Transmitter",                         "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "temperature indicator":           {"mo_ta":"Temperature Indicator",                           "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "ti":                              {"mo_ta":"Temperature Indicator",                           "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "pressure transmitter":            {"mo_ta":"Pressure Transmitter",                            "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "pt":                              {"mo_ta":"Pressure Transmitter",                            "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "pressure indicator":              {"mo_ta":"Pressure Indicator / Gauge",                      "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"pcs","section":"instrument"},
+    "pi":                              {"mo_ta":"Pressure Indicator / Gauge",                      "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"pcs","section":"instrument"},
+    "level switch":                    {"mo_ta":"Level Switch",                                    "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "ls":                              {"mo_ta":"Level Switch",                                    "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "conductivity sensor":             {"mo_ta":"Conductivity Sensor",                             "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "cs":                              {"mo_ta":"Conductivity Sensor",                             "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "flow switch":                     {"mo_ta":"Flow Switch",                                     "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "fs":                              {"mo_ta":"Flow Switch",                                     "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "proximity switch":                {"mo_ta":"Proximity Switch",                                "chung_loai":"-",          "vat_lieu":"SS304",   "tieu_chuan":"-",  "don_vi":"pcs","section":"instrument"},
+    "ph transmitter":                  {"mo_ta":"pH Transmitter",                                  "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
+    "brix transmitter":                {"mo_ta":"Brix Transmitter",                                "chung_loai":"-",          "vat_lieu":"SS316L",  "tieu_chuan":"SMS","don_vi":"set","section":"instrument"},
 }
 
-# Prefix line name → loại đường
-LINE_PREFIX_MAP = {
-    'PRD': 'sanitary', 'CIP': 'sanitary', 'PW':  'sanitary',
-    'WW':  'sanitary', 'SW':  'sanitary',
-    'IW':  'ice_water', 'IWR': 'ice_water',
-    'CW':  'cooling',  'TWR': 'cooling',  'TW':  'cooling',
-    'HW':  'hot_water', 'HWR': 'hot_water',
-    'STM': 'steam',    'S':   'steam',    'SS':  'steam',
-    'C':   'condensate', 'CN': 'condensate',
-    'IA':  'air',      'SA':  'air',      'CA':  'air', 'PA': 'air',
-    'RO':  'water',    'CW2': 'water',
+# ── TETRA PAK LIBRARY — inherits SPX base, overrides/adds TP-specific ─
+TPK_OVERRIDES = {
+    # Leakage Valve (TP only)
+    "leakage valve nc actuator":       {"mo_ta":"Leakage Valve NC – Actuator",                    "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "leakage valve no actuator":       {"mo_ta":"Leakage Valve NO – Actuator",                    "chung_loai":"Actuator NO","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "lv nc":                           {"mo_ta":"Leakage Valve NC – Actuator",                    "chung_loai":"Actuator NC","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "lv no":                           {"mo_ta":"Leakage Valve NO – Actuator",                    "chung_loai":"Actuator NO","vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    # Pumps TP
+    "centrifugal pump":                {"mo_ta":"Centrifugal Pump",                               "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "cp":                              {"mo_ta":"Centrifugal Pump",                               "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "lobe pump":                       {"mo_ta":"Lobe Pump",                                      "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "lp":                              {"mo_ta":"Lobe Pump",                                      "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "screw pump":                      {"mo_ta":"Screw Pump",                                     "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "sp":                              {"mo_ta":"Screw Pump",                                     "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "utility pump":                    {"mo_ta":"Utility Pump",                                   "chung_loai":"-",          "vat_lieu":"SS304", "tieu_chuan":"Industry","don_vi":"pcs","section":"sanitary"},
+    "up":                              {"mo_ta":"Utility Pump",                                   "chung_loai":"-",          "vat_lieu":"SS304", "tieu_chuan":"Industry","don_vi":"pcs","section":"sanitary"},
+    "diaphragm pump":                  {"mo_ta":"Diaphragm Pump",                                 "chung_loai":"-",          "vat_lieu":"PP",    "tieu_chuan":"-","don_vi":"pcs","section":"sanitary"},
+    "dp":                              {"mo_ta":"Diaphragm Pump",                                 "chung_loai":"-",          "vat_lieu":"PP",    "tieu_chuan":"-","don_vi":"pcs","section":"sanitary"},
+    # Sampling (TP names)
+    "aseptic sampling valve":          {"mo_ta":"Aseptic Sampling Valve",                         "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "asv":                             {"mo_ta":"Aseptic Sampling Valve",                         "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "sanitary sampling valve":         {"mo_ta":"Sanitary Sampling Valve",                        "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv samp":                        {"mo_ta":"Sanitary Sampling Valve",                        "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    # Filters (TP names)
+    "bag filter":                      {"mo_ta":"Bag Filter",                                     "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "bf":                              {"mo_ta":"Bag Filter",                                     "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "inline filter":                   {"mo_ta":"Inline Filter",                                  "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ilf":                             {"mo_ta":"Inline Filter",                                  "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "angle filter":                    {"mo_ta":"Angle Filter",                                   "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "af":                              {"mo_ta":"Angle Filter",                                   "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    # SSV TP (no SV4x codes)
+    "ssv 200":                         {"mo_ta":"Single Seat Valve 200",                          "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 210":                         {"mo_ta":"Single Seat Valve 210",                          "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 220":                         {"mo_ta":"Single Seat Valve 220",                          "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
+    "ssv 300":                         {"mo_ta":"Single Seat Valve 300",                          "chung_loai":"-",          "vat_lieu":"SS316L","tieu_chuan":"SMS","don_vi":"pcs","section":"sanitary"},
 }
 
-LINE_TYPE_LABELS = {
-    'sanitary':   '1. Đường Product / CIP / Process Water (Vi sinh)',
-    'ice_water':  '2. Đường Ice Water – Chiller (Công nghiệp)',
-    'cooling':    '3. Đường Cooling Water (Công nghiệp)',
-    'hot_water':  '3b. Đường Hot Water (Công nghiệp)',
-    'steam':      '4. Đường Steam (Công nghiệp)',
-    'condensate': '4b. Đường Condensate (Công nghiệp)',
-    'air':        '5. Đường Air (Khí nén)',
-    'water':      '6. Đường RO / City Water',
-    'unknown':    '0. Chưa xác định loại đường',
+# Build TP library = SPX base + overrides
+TPK_LIBRARY = {**SPX_LIBRARY, **TPK_OVERRIDES}
+
+SECTION_LABELS = {
+    "sanitary":  "ĐƯỜNG PRODUCT / CIP / PROCESS WATER (VI SINH)",
+    "ice_water": "ĐƯỜNG ICE WATER / COOLING WATER",
+    "steam":     "ĐƯỜNG STEAM / CONDENSATE",
+    "air":       "ĐƯỜNG KHÍ NÉN / NƯỚC THÀNH PHỐ",
+    "instrument":"INSTRUMENT",
+    "equipment": "THIẾT BỊ",
+    "unknown":   "THIẾT BỊ CHƯA XÁC ĐỊNH",
 }
+SECTION_ORDER = ["sanitary", "ice_water", "steam", "air", "instrument", "equipment", "unknown"]
+# fmt: on
 
-# Thư viện thiết bị: key = tên chuẩn hóa (lowercase, space)
-# value = dict {desc, act, category}
-# category: 'sanitary' hoặc 'utility'
-EQUIPMENT_LIBRARY = {
-    # ── SSV Tetra Pak ─────────────────────────────────────────────────────
-    'ssv 200 manual':   {'desc': 'Single Seat Valve 200',        'act': 'Manual',        'cat': 'sanitary'},
-    'ssv 200 actuator': {'desc': 'Single Seat Valve 200',        'act': 'Actuator NC',   'cat': 'sanitary'},
-    'ssv 200 thinktop': {'desc': 'Single Seat Valve 200',        'act': 'Thinktop',      'cat': 'sanitary'},
-    'ssv 210 manual':   {'desc': 'Single Seat Valve 210',        'act': 'Manual',        'cat': 'sanitary'},
-    'ssv 210 actuator': {'desc': 'Single Seat Valve 210',        'act': 'Actuator NC',   'cat': 'sanitary'},
-    'ssv 210 thinktop': {'desc': 'Single Seat Valve 210',        'act': 'Thinktop',      'cat': 'sanitary'},
-    'ssv 220 manual':   {'desc': 'Single Seat Valve 220',        'act': 'Manual',        'cat': 'sanitary'},
-    'ssv 220 actuator': {'desc': 'Single Seat Valve 220',        'act': 'Actuator NC',   'cat': 'sanitary'},
-    'ssv 220 thinktop': {'desc': 'Single Seat Valve 220',        'act': 'Thinktop',      'cat': 'sanitary'},
-    'ssv 300 manual':   {'desc': 'Single Seat Valve 300',        'act': 'Manual',        'cat': 'sanitary'},
-    'ssv 300 actuator': {'desc': 'Single Seat Valve 300',        'act': 'Actuator NC',   'cat': 'sanitary'},
-    'ssv 300 thinktop': {'desc': 'Single Seat Valve 300',        'act': 'Thinktop',      'cat': 'sanitary'},
-    # ── SSV SPX (có model SV41/42/43/44) ─────────────────────────────────
-    'ssv 200 sv41 l manual':   {'desc': 'SSV 200 SV41-L',  'act': 'Manual',        'cat': 'sanitary'},
-    'ssv 200 sv41 l actuator': {'desc': 'SSV 200 SV41-L',  'act': 'Actuator NC',   'cat': 'sanitary'},
-    'ssv 200 sv41 l thinktop': {'desc': 'SSV 200 SV41-L',  'act': 'Thinktop',      'cat': 'sanitary'},
-    'ssv 210 sv43 ll manual':  {'desc': 'SSV 210 SV43-LL', 'act': 'Manual',        'cat': 'sanitary'},
-    'ssv 210 sv43 ll actuator':{'desc': 'SSV 210 SV43-LL', 'act': 'Actuator NC',   'cat': 'sanitary'},
-    'ssv 210 sv43 ll thinktop':{'desc': 'SSV 210 SV43-LL', 'act': 'Thinktop',      'cat': 'sanitary'},
-    'ssv 220 sv44 tl manual':  {'desc': 'SSV 220 SV44-TL', 'act': 'Manual',        'cat': 'sanitary'},
-    'ssv 220 sv44 tl actuator':{'desc': 'SSV 220 SV44-TL', 'act': 'Actuator NC',   'cat': 'sanitary'},
-    'ssv 220 sv44 tl thinktop':{'desc': 'SSV 220 SV44-TL', 'act': 'Thinktop',      'cat': 'sanitary'},
-    'ssv 300 sv42 t manual':   {'desc': 'SSV 300 SV42-T',  'act': 'Manual',        'cat': 'sanitary'},
-    'ssv 300 sv42 t actuator': {'desc': 'SSV 300 SV42-T',  'act': 'Actuator NC',   'cat': 'sanitary'},
-    'ssv 300 sv42 t thinktop': {'desc': 'SSV 300 SV42-T',  'act': 'Thinktop',      'cat': 'sanitary'},
-    # ── Shorthand SSV SPX ─────────────────────────────────────────────────
-    'ssv 200 sv41': {'desc': 'SSV 200 SV41-L', 'act': 'Actuator NC', 'cat': 'sanitary'},
-    'ssv 210 sv43': {'desc': 'SSV 210 SV43-LL','act': 'Actuator NC', 'cat': 'sanitary'},
-    'ssv 220 sv44': {'desc': 'SSV 220 SV44-TL','act': 'Actuator NC', 'cat': 'sanitary'},
-    'ssv 300 sv42': {'desc': 'SSV 300 SV42-T', 'act': 'Actuator NC', 'cat': 'sanitary'},
-    # ── MPV ───────────────────────────────────────────────────────────────
-    'mpv actuator': {'desc': 'Mixproof Valve',  'act': 'Actuator NC', 'cat': 'sanitary'},
-    'mpv thinktop': {'desc': 'Mixproof Valve',  'act': 'Thinktop',    'cat': 'sanitary'},
-    'mpv a':        {'desc': 'Mixproof Valve',  'act': 'Actuator NC', 'cat': 'sanitary'},
-    'mpv tk':       {'desc': 'Mixproof Valve',  'act': 'Thinktop',    'cat': 'sanitary'},
-    # ── BFV Sanitary ──────────────────────────────────────────────────────
-    'bfv manual':      {'desc': 'Butterfly Valve', 'act': 'Manual',      'cat': 'sanitary'},
-    'bfv actuator':    {'desc': 'Butterfly Valve', 'act': 'Actuator NC', 'cat': 'sanitary'},
-    'bfv thinktop':    {'desc': 'Butterfly Valve', 'act': 'Thinktop',    'cat': 'sanitary'},
-    'bfv m':           {'desc': 'Butterfly Valve', 'act': 'Manual',      'cat': 'sanitary'},
-    'bfv a':           {'desc': 'Butterfly Valve', 'act': 'Actuator NC', 'cat': 'sanitary'},
-    'bfv tk':          {'desc': 'Butterfly Valve', 'act': 'Thinktop',    'cat': 'sanitary'},
-    'butterfly valve manual':      {'desc': 'Butterfly Valve', 'act': 'Manual',      'cat': 'sanitary'},
-    'butterfly valve actuator':    {'desc': 'Butterfly Valve', 'act': 'Actuator NC', 'cat': 'sanitary'},
-    'butterfly valve thinktop':    {'desc': 'Butterfly Valve', 'act': 'Thinktop',    'cat': 'sanitary'},
-    # ── Leakage Valve (Tetra Pak đặc thù) ────────────────────────────────
-    'lv nc':             {'desc': 'Leakage Valve NC', 'act': 'Actuator NC', 'cat': 'sanitary'},
-    'lv no':             {'desc': 'Leakage Valve NO', 'act': 'Actuator NO', 'cat': 'sanitary'},
-    'leakage valve nc':  {'desc': 'Leakage Valve NC', 'act': 'Actuator NC', 'cat': 'sanitary'},
-    'leakage valve no':  {'desc': 'Leakage Valve NO', 'act': 'Actuator NO', 'cat': 'sanitary'},
-    # ── Sanitary Components ───────────────────────────────────────────────
-    'nrv':              {'desc': 'Non-Return Valve',     'act': '—', 'cat': 'sanitary'},
-    'non return valve': {'desc': 'Non-Return Valve',     'act': '—', 'cat': 'sanitary'},
-    'sg':               {'desc': 'Sight Glass',          'act': '—', 'cat': 'sanitary'},
-    'sight glass':      {'desc': 'Sight Glass',          'act': '—', 'cat': 'sanitary'},
-    'cpv':              {'desc': 'Constant Pressure Valve', 'act': '—', 'cat': 'sanitary'},
-    'asv':              {'desc': 'Aseptic Sampling Valve',  'act': '—', 'cat': 'sanitary'},
-    'sva':              {'desc': 'Sampling Valve',       'act': 'Actuator', 'cat': 'sanitary'},
-    'svm':              {'desc': 'Sampling Valve',       'act': 'Manual',   'cat': 'sanitary'},
-    'sampling valve':   {'desc': 'Sampling Valve',       'act': '—',        'cat': 'sanitary'},
-    'ssv samp':         {'desc': 'Sanitary Sampling Valve','act': '—',      'cat': 'sanitary'},
-    # ── Pumps (Sanitary) ──────────────────────────────────────────────────
-    'cp':      {'desc': 'Centrifugal Pump',   'act': '—', 'cat': 'sanitary'},
-    'cp w+':   {'desc': 'Centrifugal Pump W+','act': '—', 'cat': 'sanitary'},
-    'cp ws+':  {'desc': 'Centrifugal Pump WS+','act': '—','cat': 'sanitary'},
-    'lp':      {'desc': 'Lobe Pump',          'act': '—', 'cat': 'sanitary'},
-    'lp dw+':  {'desc': 'Lobe Pump DW+',      'act': '—', 'cat': 'sanitary'},
-    'sp':      {'desc': 'Screw Pump',         'act': '—', 'cat': 'sanitary'},
-    'dp pump': {'desc': 'Diaphragm Pump',     'act': '—', 'cat': 'sanitary'},
-    'up':      {'desc': 'Utility Pump',       'act': '—', 'cat': 'utility'},
-    'vac':     {'desc': 'Vacuum Pump',        'act': '—', 'cat': 'utility'},
-    'lrp':     {'desc': 'Liquid Ring Pump',   'act': '—', 'cat': 'sanitary'},
-    # ── Filters / Equipment ───────────────────────────────────────────────
-    'bf':           {'desc': 'Bag Filter',        'act': '—', 'cat': 'sanitary'},
-    'bag filter':   {'desc': 'Bag Filter',        'act': '—', 'cat': 'sanitary'},
-    'ilf':          {'desc': 'Inline Filter',     'act': '—', 'cat': 'sanitary'},
-    'af':           {'desc': 'Angle Filter',      'act': '—', 'cat': 'sanitary'},
-    'sf':           {'desc': 'Sterile Filter',    'act': '—', 'cat': 'sanitary'},
-    'fsh':          {'desc': 'Inline Filter FSH', 'act': '—', 'cat': 'sanitary'},
-    'fsr':          {'desc': 'Inline Filter FSR', 'act': '—', 'cat': 'sanitary'},
-    'phe':          {'desc': 'Plate Heat Exchanger',   'act': '—', 'cat': 'sanitary'},
-    'the':          {'desc': 'Tubular Heat Exchanger', 'act': '—', 'cat': 'sanitary'},
-    # ── Utility Valves ────────────────────────────────────────────────────
-    'gv m':              {'desc': 'Globe Valve', 'act': 'Manual',              'cat': 'utility'},
-    'gv a':              {'desc': 'Globe Valve', 'act': 'Actuator NC',         'cat': 'utility'},
-    'gv s':              {'desc': 'Globe Valve', 'act': 'Solenoid',            'cat': 'utility'},
-    'gv lc':             {'desc': 'Globe Valve', 'act': 'Pneumatic Modulating','cat': 'utility'},
-    'globe valve manual':        {'desc': 'Globe Valve', 'act': 'Manual',              'cat': 'utility'},
-    'globe valve actuator':      {'desc': 'Globe Valve', 'act': 'Actuator NC',         'cat': 'utility'},
-    'globe valve modulating':    {'desc': 'Globe Valve', 'act': 'Pneumatic Modulating','cat': 'utility'},
-    'globe valve':               {'desc': 'Globe Valve', 'act': 'Manual',              'cat': 'utility'},
-    'bv m':              {'desc': 'Ball Valve',  'act': 'Manual',              'cat': 'utility'},
-    'bv a':              {'desc': 'Ball Valve',  'act': 'Actuator NC',         'cat': 'utility'},
-    'bv s':              {'desc': 'Ball Valve',  'act': 'Solenoid',            'cat': 'utility'},
-    'ball valve manual':  {'desc': 'Ball Valve', 'act': 'Manual',              'cat': 'utility'},
-    'ball valve actuator':{'desc': 'Ball Valve', 'act': 'Actuator NC',         'cat': 'utility'},
-    'ball valve':         {'desc': 'Ball Valve', 'act': 'Manual',              'cat': 'utility'},
-    'bfv um':            {'desc': 'Butterfly Valve (Utility)', 'act': 'Manual',       'cat': 'utility'},
-    'bfv ua':            {'desc': 'Butterfly Valve (Utility)', 'act': 'Actuator NC',  'cat': 'utility'},
-    'butterfly valve utility manual':  {'desc': 'Butterfly Valve (Utility)', 'act': 'Manual',      'cat': 'utility'},
-    'butterfly valve utility actuator':{'desc': 'Butterfly Valve (Utility)', 'act': 'Actuator NC', 'cat': 'utility'},
-    'cv':                {'desc': 'Check Valve', 'act': '—', 'cat': 'utility'},
-    'check valve':       {'desc': 'Check Valve', 'act': '—', 'cat': 'utility'},
-    'asv a':             {'desc': 'Angle Seat Valve', 'act': 'Actuator NC',    'cat': 'utility'},
-    'asv s':             {'desc': 'Angle Seat Valve', 'act': 'Solenoid',       'cat': 'utility'},
-    'angle seat valve':  {'desc': 'Angle Seat Valve', 'act': 'Actuator NC',    'cat': 'utility'},
-    'angle piston valve':{'desc': 'Angle Piston Valve','act': 'Actuator NC',   'cat': 'utility'},
-    'dv m':              {'desc': 'Diaphragm Valve', 'act': 'Manual',          'cat': 'utility'},
-    'dv a':              {'desc': 'Diaphragm Valve', 'act': 'Actuator NC',     'cat': 'utility'},
-    # ── Utility Components ────────────────────────────────────────────────
-    'ys':                {'desc': 'Y Strainer',           'act': '—', 'cat': 'utility'},
-    'y strainer':        {'desc': 'Y Strainer',           'act': '—', 'cat': 'utility'},
-    'st':                {'desc': 'Steam Trap',           'act': '—', 'cat': 'utility'},
-    'steam trap':        {'desc': 'Steam Trap',           'act': '—', 'cat': 'utility'},
-    'float steam trap':  {'desc': 'Float Steam Trap',     'act': '—', 'cat': 'utility'},
-    'thermal dynamic steam trap': {'desc': 'Thermal Dynamic Steam Trap (Bẫy đồng tiền)', 'act': '—', 'cat': 'utility'},
-    'rpv':               {'desc': 'Pressure Reducing Valve','act': '—', 'cat': 'utility'},
-    'pressure reducing valve': {'desc': 'Pressure Reducing Valve','act': '—','cat': 'utility'},
-    'prv':               {'desc': 'Pressure Relief Valve', 'act': '—', 'cat': 'utility'},
-    'pressure safety valve': {'desc': 'Pressure Safety Valve','act': '—', 'cat': 'utility'},
-    'arv':               {'desc': 'Air Relief Valve',     'act': '—', 'cat': 'utility'},
-    'vrv':               {'desc': 'Vacuum Relief Valve',  'act': '—', 'cat': 'utility'},
-    'ev':                {'desc': 'Expansion Vessel',     'act': '—', 'cat': 'utility'},
-    'ej':                {'desc': 'Expansion Joint',      'act': '—', 'cat': 'utility'},
-    'sil':               {'desc': 'Silencer',             'act': '—', 'cat': 'utility'},
-    'syphon':            {'desc': 'Syphon',               'act': '—', 'cat': 'utility'},
-    'sy180':             {'desc': 'Syphon 180°',          'act': '—', 'cat': 'utility'},
-    'sy90':              {'desc': 'Syphon 90°',           'act': '—', 'cat': 'utility'},
-}
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. CORE PARSING FUNCTIONS
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  MATCHING ENGINE
+# ═══════════════════════════════════════════════════════════════════
 
-def normalize_block_name(name: str) -> set:
-    """Chuẩn hóa block name → set of words (lowercase, replace - _ with space)."""
-    name = name.lower().strip()
-    name = re.sub(r'[-_/]', ' ', name)
+def normalize(name: str) -> set:
+    """Lowercase + replace -_ with space → set of words."""
+    name = name.lower()
+    name = re.sub(r"[-_]", " ", name)
     return set(name.split())
 
 
-def is_linename_block(block_name: str) -> bool:
-    """Kiểm tra xem block có phải là linename block không."""
-    norm = block_name.lower().replace('-', '').replace('_', '')
-    for kw in LINENAME_BLOCK_KEYWORDS:
-        kw_norm = kw.replace(' ', '').replace('-', '').replace('_', '')
-        if kw_norm in norm:
+def match_library(block_name: str, library: dict):
+    """Return (canonical_key, info_dict) or (None, None)."""
+    b = normalize(block_name)
+    # Exact word-set match first
+    for lib_key, info in library.items():
+        l = set(lib_key.split())
+        if b == l or b.issubset(l) or l.issubset(b):
+            return lib_key, info
+    return None, None
+
+
+def should_ignore(block_name: str) -> bool:
+    words = normalize(block_name)
+    for ign in IGNORE_BLOCKS:
+        if set(ign.split()).issubset(words):
             return True
     return False
 
 
-def is_ignore_block(block_name: str) -> bool:
-    """True nếu block nằm trong danh sách bỏ qua."""
-    norm_words = normalize_block_name(block_name)
-    for kw in IGNORE_BLOCK_KEYWORDS:
-        kw_words = set(kw.split())
-        if kw_words.issubset(norm_words) or norm_words.issubset(kw_words):
-            return True
-    return False
+# ═══════════════════════════════════════════════════════════════════
+#  DXF READER
+# ═══════════════════════════════════════════════════════════════════
 
-
-def match_equipment(block_name: str) -> dict | None:
+def parse_dxf(dxf_bytes: bytes, library: dict):
     """
-    Word-order-insensitive matching: so tên block với thư viện.
-    Trả về equipment info dict hoặc None nếu không tìm thấy.
+    Returns:
+        rows  : list of dict  → one per unique (block_name, dn) combination
+        unknowns : list of str  → block names not in library
+        size_texts : list of {'dn', 'x', 'y'}
+        warnings : list of str
     """
-    b_words = normalize_block_name(block_name)
-    best_match = None
-    best_score = 0
-    for lib_key, lib_info in EQUIPMENT_LIBRARY.items():
-        l_words = set(lib_key.split())
-        if b_words == l_words or b_words.issubset(l_words) or l_words.issubset(b_words):
-            # Ưu tiên match dài hơn (nhiều từ trùng hơn)
-            score = len(b_words & l_words)
-            if score > best_score:
-                best_score = score
-                best_match = {**lib_info, 'matched_key': lib_key}
-    return best_match
+    with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
+        tmp.write(dxf_bytes)
+        tmp_path = tmp.name
 
+    doc = ezdxf.readfile(tmp_path)
+    msp = doc.modelspace()
 
-def get_line_type(line_name: str) -> str:
-    """Xác định loại đường từ tên line (vd: IW-001 → ice_water)."""
-    if not line_name:
-        return 'unknown'
-    prefix = re.split(r'[-_\d]', line_name.strip())[0].upper()
-    return LINE_PREFIX_MAP.get(prefix, 'unknown')
+    equipments = []  # {'name': str, 'x': float, 'y': float}
+    size_texts = []  # {'dn': str, 'x': float, 'y': float}
 
-
-def nearest_annotation(ex, ey, candidates, max_dist=300):
-    """Tìm annotation gần nhất trong max_dist đơn vị. Trả về dn_str hoặc '?'."""
-    best, best_d = None, float('inf')
-    for t in candidates:
-        d = math.hypot(t['x'] - ex, t['y'] - ey)
-        if d < best_d:
-            best_d, best = d, t
-    if best and best_d <= max_dist:
-        return best['dn'], round(best_d, 1)
-    return '?', None
-
-
-def get_dn_number(dn_str: str):
-    """'DN50' → 50, '2"' → ~50 (approx), '?' → None."""
-    if not dn_str or dn_str == '?':
-        return None
-    m = re.search(r'DN\s*(\d+)', dn_str, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    # Inch conversion
-    inch_m = re.search(r'(\d+(?:\.\d+)?)\s*["\']', dn_str)
-    if inch_m:
-        inch_map = {'0.5': 15, '0.75': 20, '1': 25, '1.25': 32, '1.5': 40,
-                    '2': 50, '2.5': 65, '3': 80, '4': 100, '6': 150, '8': 200}
-        return inch_map.get(inch_m.group(1), None)
-    return None
-
-
-def is_small_size(dn_str: str) -> bool:
-    """True nếu size < DN50 → dùng Thread end."""
-    n = get_dn_number(dn_str)
-    if n is None:
-        return False
-    return n < 50
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 3. SPEC LOOKUP — Quy tắc từ skill
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_spec(equip_info: dict, line_type: str, dn_str: str) -> dict:
-    """
-    Trả về spec: {material, standard, connection, warning}
-    Tuân thủ:
-      - Quy tắc 1: Xác định line trước, áp spec sau
-      - Quy tắc 2: Size < DN50 → Thread end (chỉ cho thiết bị công nghiệp)
-    """
-    cat = equip_info.get('cat', 'utility')
-    desc = equip_info.get('desc', '')
-    small = is_small_size(dn_str)
-    warn = ''
-
-    # ── Sanitary (Vi sinh) ─────────────────────────────────────────────────
-    # Áp dụng khi: cat='sanitary' HOẶC line_type='sanitary'
-    # Quy tắc 2 KHÔNG áp dụng → dùng Clamp/SMS theo size riêng
-    if cat == 'sanitary' or line_type == 'sanitary':
-        return {'material': 'SS316L', 'standard': 'SMS',
-                'connection': 'SMS', 'warning': ''}
-
-    # ── Từ đây: thiết bị công nghiệp (utility) ────────────────────────────
-
-    # ── Ice Water / Cooling Water ──────────────────────────────────────────
-    if line_type in ('ice_water', 'cooling', 'hot_water', 'water'):
-        if 'Globe Valve' in desc:
-            return {'material': '—', 'standard': '—', 'connection': '—',
-                    'warning': '⚠️ KHÔNG dùng Globe Valve trên đường nước!'}
-
-        if small:  # DN < 50 → Thread end
-            if 'Ball Valve' in desc:
-                mat, std, conn = 'Brass', 'Thread end', 'Thread end'
-            elif 'Check Valve' in desc:
-                mat, std, conn = 'Brass', 'Thread end', 'Thread end'
-            elif 'Y Strainer' in desc:
-                mat, std, conn = 'Cast Iron', 'Thread end', 'Thread end'
-            elif 'Pressure Safety' in desc:
-                mat, std, conn = 'Brass', 'Thread end', 'Thread end'
-            else:
-                mat, std, conn = 'Brass', 'Thread end', 'Thread end'
-        else:  # DN ≥ 50 → Flange JIS10K
-            if 'Butterfly' in desc:
-                mat, std, conn = 'Cast Iron / Disc SS304', 'JIS10K', 'Flange RF'
-            elif 'Check Valve' in desc:
-                mat, std, conn = 'Cast Iron', 'PN16', 'Flange RF'
-            elif 'Y Strainer' in desc:
-                mat, std, conn = 'Cast Iron', 'JIS10K', 'Flange RF'
-            else:
-                mat, std, conn = 'Cast Iron / Disc SS304', 'JIS10K', 'Flange RF'
-        return {'material': mat, 'standard': std, 'connection': conn, 'warning': warn}
-
-    # ── Steam / Condensate ─────────────────────────────────────────────────
-    if line_type in ('steam', 'condensate'):
-        if 'Globe Valve' in desc:
-            if small:
-                return {'material': 'Cast Iron', 'standard': 'Thread end',
-                        'connection': 'Thread end', 'warning': ''}
-            else:
-                return {'material': 'Cast Iron', 'standard': 'PN16',
-                        'connection': 'Flange RF', 'warning': ''}
-
-        if 'Angle Piston' in desc or 'Angle Seat' in desc:
-            # Angle piston valve luôn dùng Thread end (SS304)
-            return {'material': 'SS304', 'standard': 'Thread end',
-                    'connection': 'Thread end', 'warning': ''}
-
-        if 'Y Strainer' in desc:
-            if small:
-                return {'material': 'Cast Iron', 'standard': 'Thread end',
-                        'connection': 'Thread end', 'warning': ''}
-            else:
-                return {'material': 'Cast Iron', 'standard': 'PN16',
-                        'connection': 'Flange RF', 'warning': ''}
-
-        if 'Steam Trap' in desc:
-            if 'Thermal Dynamic' in desc or small:
-                return {'material': 'Cast Iron', 'standard': 'Thread end',
-                        'connection': 'Thread end', 'warning': ''}
-            else:
-                return {'material': 'Cast Iron', 'standard': 'PN16',
-                        'connection': 'Flange RF', 'warning': ''}
-
-        if 'Pressure Reducing' in desc:
-            return {'material': 'Cast Iron', 'standard': 'PN16',
-                    'connection': 'Flange RF', 'warning': ''}
-
-        if 'Safety' in desc or 'Relief' in desc:
-            if small:
-                return {'material': 'Brass', 'standard': 'Thread end',
-                        'connection': 'Thread end', 'warning': ''}
-            else:
-                return {'material': 'Cast Iron', 'standard': 'PN16',
-                        'connection': 'Flange RF', 'warning': ''}
-
-        if 'Check Valve' in desc:
-            if small:
-                return {'material': 'SS304', 'standard': 'Thread end',
-                        'connection': 'Thread end', 'warning': ''}
-            else:
-                return {'material': 'SS304', 'standard': 'PN16',
-                        'connection': 'Flange RF', 'warning': ''}
-
-        # Default steam valve
-        if small:
-            return {'material': 'Cast Iron', 'standard': 'Thread end',
-                    'connection': 'Thread end', 'warning': ''}
-        else:
-            return {'material': 'Cast Iron', 'standard': 'PN16',
-                    'connection': 'Flange RF', 'warning': ''}
-
-    # ── Air / Instrument Air ───────────────────────────────────────────────
-    if line_type == 'air':
-        if small:
-            return {'material': 'SS304', 'standard': 'Thread end',
-                    'connection': 'Thread end', 'warning': ''}
-        else:
-            return {'material': 'SS304', 'standard': 'PN16',
-                    'connection': 'Flange RF', 'warning': ''}
-
-    # ── Unknown / Fallback ─────────────────────────────────────────────────
-    return {'material': '—', 'standard': '—', 'connection': '—',
-            'warning': '⚠️ Chưa xác định loại đường — kiểm tra linename block'}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. DXF READER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def read_attribs(insert_entity) -> list[str]:
-    """Đọc tất cả attribute text trong một INSERT entity."""
-    texts = []
-    try:
-        for attrib in insert_entity.attribs:
-            t = attrib.dxf.text.strip()
-            if t:
-                texts.append(t)
-    except Exception:
-        pass
-    return texts
-
-
-def parse_dxf(file_bytes: bytes) -> dict:
-    """
-    Parse DXF → trả về:
-      {
-        'linenames': [{'name': str, 'line_type': str, 'x': float, 'y': float}],
-        'equipment': [{'block_name': str, 'x': float, 'y': float,
-                       'equip_info': dict|None, 'dn': str, 'line_name': str,
-                       'line_type': str, 'spec': dict}],
-        'size_annotations': [{'dn': str, 'x': float, 'y': float}],
-        'unknown_blocks': [str],
-        'errors': [str],
-      }
-    """
-    errors = []
-    linenames = []
-    equipment_raw = []
-    size_annotations = []
-    unknown_blocks = []
-
-    try:
-        stream = io.BytesIO(file_bytes)
-        doc = ezdxf.read(stream)
-        msp = doc.modelspace()
-    except Exception as e:
-        return {'linenames': [], 'equipment': [], 'size_annotations': [],
-                'unknown_blocks': [], 'errors': [f'Lỗi đọc DXF: {e}']}
-
-    # ── Pass 1: Thu thập tất cả entities ──────────────────────────────────
-    for entity in msp:
-        etype = entity.dxftype()
-
-        if etype == 'INSERT':
-            block_name = entity.dxf.name
+    for e in msp:
+        dtype = e.dxftype()
+        if dtype == "INSERT":
             try:
-                pos = entity.dxf.insert
-                x, y = float(pos.x), float(pos.y)
+                bname = e.dxf.name
+                if should_ignore(bname):
+                    continue
+                pos = e.dxf.insert
+                equipments.append({"name": bname, "x": pos.x, "y": pos.y})
             except Exception:
-                continue
-
-            # Linename block?
-            if is_linename_block(block_name):
-                attribs = read_attribs(entity)
-                line_text = ' '.join(attribs).strip()
-                # Lọc lấy tên line thực sự (vd: IW-001, PRD-003)
-                line_codes = re.findall(r'[A-Z]{1,5}-?\d{3,}|[A-Z]{2,5}\d*', line_text)
-                code = line_codes[0] if line_codes else line_text or block_name
-                lt = get_line_type(code)
-                linenames.append({'name': code, 'line_type': lt, 'x': x, 'y': y})
-                continue
-
-            # Equipment block
-            if is_ignore_block(block_name):
-                continue
-
-            equipment_raw.append({'block_name': block_name, 'x': x, 'y': y})
-
-        elif etype in ('TEXT', 'MTEXT'):
+                pass
+        elif dtype in ("TEXT", "MTEXT"):
             try:
-                raw_text = entity.text if etype == 'MTEXT' else entity.dxf.text
-                pos = entity.dxf.insert
-                x, y = float(pos.x), float(pos.y)
-                # Tìm DN annotation
-                dn_match = re.search(r'DN\s*\d+', raw_text, re.IGNORECASE)
-                if dn_match:
-                    size_annotations.append({
-                        'dn': dn_match.group().upper().replace(' ', ''),
-                        'x': x, 'y': y
-                    })
-                # Tìm inch annotation
-                inch_match = re.search(r'\d+\.?\d*\s*["\']', raw_text)
-                if inch_match and not dn_match:
-                    size_annotations.append({
-                        'dn': inch_match.group().strip(),
-                        'x': x, 'y': y
-                    })
+                raw = e.text if dtype == "MTEXT" else e.dxf.text
+                # Strip MTEXT formatting codes
+                raw = re.sub(r"\\[a-zA-Z][^;]*;", "", raw)
+                raw = re.sub(r"\{[^}]*\}", "", raw)
+                pos = e.dxf.insert
+                # Match DN notation
+                dn_m = re.search(r"DN\s*\d+", raw)
+                if dn_m:
+                    dn_str = dn_m.group().replace(" ", "")
+                    size_texts.append({"dn": dn_str, "x": pos.x, "y": pos.y})
+                # Match inch notation like 1", 1.5", 2"
+                inch_m = re.search(r'(\d+(?:\.\d+)?)"', raw)
+                if inch_m and not dn_m:
+                    size_texts.append({"dn": inch_m.group(), "x": pos.x, "y": pos.y})
             except Exception:
                 pass
 
-    # ── Pass 2: Gán line và size cho từng thiết bị ─────────────────────────
-    equipment_out = []
-    for eq in equipment_raw:
-        # Tìm size gần nhất (Kỹ năng 1 — Proximity Detection)
-        dn, dn_dist = nearest_annotation(eq['x'], eq['y'], size_annotations, max_dist=300)
+    # ── Proximity detection ──────────────────────────────────────
+    def nearest_dn(ex, ey):
+        best, best_d = None, float("inf")
+        for t in size_texts:
+            d = math.hypot(t["x"] - ex, t["y"] - ey)
+            if d < best_d:
+                best_d, best = d, t
+        if best and best_d <= MAX_DIST:
+            return best["dn"], round(best_d, 1)
+        return "?", None
 
-        # Tìm linename gần nhất theo trục Y (cùng hàng ngang trên P&ID)
-        # Ưu tiên linename ở bên TRÁI (x nhỏ hơn) và cùng y
-        best_line = None
-        best_line_dist = float('inf')
-        for ln in linenames:
-            # Khoảng cách theo y (cùng đường ống nằm ngang)
-            y_dist = abs(ln['y'] - eq['y'])
-            x_dist = abs(ln['x'] - eq['x'])
-            dist = math.hypot(x_dist * 0.3, y_dist)  # ưu tiên y-alignment
-            if dist < best_line_dist:
-                best_line_dist = dist
-                best_line = ln
+    # ── Aggregate by (block_name, dn) ────────────────────────────
+    counter = defaultdict(lambda: defaultdict(int))  # block_name → dn → count
+    for eq in equipments:
+        dn, _ = nearest_dn(eq["x"], eq["y"])
+        counter[eq["name"]][dn] += 1
 
-        line_name = best_line['name'] if best_line else 'UNKNOWN'
-        line_type = best_line['line_type'] if best_line else 'unknown'
+    # ── Build result rows ─────────────────────────────────────────
+    rows = []
+    unknowns = []
+    warnings = []
 
-        # Match equipment
-        equip_info = match_equipment(eq['block_name'])
-        if equip_info is None:
-            unknown_blocks.append(eq['block_name'])
+    for bname, dn_counts in sorted(counter.items()):
+        _, info = match_library(bname, library)
+        if info is None:
+            # Unknown block
+            unknowns.append(bname)
+            for dn, qty in dn_counts.items():
+                rows.append({
+                    "block_name": bname,
+                    "mo_ta":      f"UNKNOWN — {bname}",
+                    "chung_loai": "-",
+                    "vat_lieu":   "-",
+                    "kt1":        dn,
+                    "kt2":        "-",
+                    "tieu_chuan": "-",
+                    "xuat_xu":    "-",
+                    "don_vi":     "pcs",
+                    "so_luong":   qty,
+                    "section":    "unknown",
+                })
+        else:
+            for dn, qty in dn_counts.items():
+                if dn == "?":
+                    warnings.append(f"⚠️ {bname}: size chưa xác định (×{qty}) — kiểm tra bản vẽ")
+                rows.append({
+                    "block_name": bname,
+                    "mo_ta":      info["mo_ta"],
+                    "chung_loai": info["chung_loai"],
+                    "vat_lieu":   info["vat_lieu"],
+                    "kt1":        dn,
+                    "kt2":        "-",
+                    "tieu_chuan": info["tieu_chuan"],
+                    "xuat_xu":    "-",
+                    "don_vi":     info["don_vi"],
+                    "so_luong":   qty,
+                    "section":    info["section"],
+                })
 
-        # Lấy spec
-        spec = {}
-        if equip_info:
-            spec = get_spec(equip_info, line_type, dn)
-
-        equipment_out.append({
-            'block_name': eq['block_name'],
-            'x': eq['x'], 'y': eq['y'],
-            'equip_info': equip_info,
-            'dn': dn,
-            'dn_dist': dn_dist,
-            'line_name': line_name,
-            'line_type': line_type,
-            'spec': spec,
-        })
-
-    return {
-        'linenames': linenames,
-        'equipment': equipment_out,
-        'size_annotations': size_annotations,
-        'unknown_blocks': list(set(unknown_blocks)),
-        'errors': errors,
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 5. POST-EXPORT VERIFICATION (Kỹ năng 2)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def verify_bom(equipment_list: list, bom_rows: list) -> list[str]:
-    """
-    So sánh số lượng thiết bị trong DXF với BOM.
-    Trả về list error strings.
-    """
-    errors = []
-    # Build summary từ equipment_list
-    summary = defaultdict(lambda: defaultdict(int))
-    for eq in equipment_list:
-        if eq['equip_info']:
-            desc = eq['equip_info']['desc']
-            summary[desc][eq['dn']] += 1
-
-    # Kiểm tra 1: Tổng số lượng
-    for desc, sizes in summary.items():
-        total_dxf = sum(sizes.values())
-        total_bom = sum(r['sl'] for r in bom_rows if desc in r.get('mo_ta', ''))
-        if total_bom != total_dxf:
-            errors.append(f'❌ TỔNG: {desc} → DXF={total_dxf}, BOM={total_bom}')
-
-    # Kiểm tra 2: Số lượng theo size
-    for desc, sizes in summary.items():
-        for dn, count_dxf in sizes.items():
-            count_bom = sum(r['sl'] for r in bom_rows
-                            if desc in r.get('mo_ta', '') and r.get('kt1') == dn)
-            if count_bom != count_dxf:
-                errors.append(f'❌ SIZE: {desc} {dn} → DXF={count_dxf}, BOM={count_bom}')
-
-    # Kiểm tra 3: Unknown size
-    for desc, sizes in summary.items():
-        if '?' in sizes:
-            errors.append(f'⚠️  UNKNOWN SIZE: {desc} × {sizes["?"]} EA — cần kiểm tra bản vẽ')
-
-    return errors
+    return rows, unknowns, size_texts, warnings
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 6. BOM EXCEL GENERATOR — FORM_BOM_STANDARD
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  XLSX BOM BUILDER
+# ═══════════════════════════════════════════════════════════════════
 
 def thin_border():
-    s = Side(style='thin')
+    s = Side(style="thin")
     return Border(left=s, right=s, top=s, bottom=s)
 
-BG_CYAN   = PatternFill('solid', fgColor='00FFFF')
-BG_YELLOW = PatternFill('solid', fgColor='FFFF00')
-BG_NONE   = PatternFill(fill_type=None)
-FG_RED    = 'FF0000'
-FG_BLACK  = '000000'
+
+def apply_cell(cell, value, bg_fill, font_color, bold, size=11,
+               h_align="center", wrap=True):
+    cell.value = value
+    cell.fill  = bg_fill
+    cell.font  = Font(name="Arial", bold=bold, size=size, color=font_color)
+    cell.border = thin_border()
+    cell.alignment = Alignment(horizontal=h_align, vertical="center", wrap_text=wrap)
 
 
-def _cell(ws, row, col, value='', bg=None, bold=False,
-          color='000000', size=11, halign='center', valign='center'):
-    c = ws.cell(row=row, column=col, value=value)
-    c.font = Font(name='Arial', bold=bold, size=size, color=color)
-    c.fill = bg if bg else BG_NONE
-    c.border = thin_border()
-    c.alignment = Alignment(horizontal=halign, vertical=valign, wrap_text=True)
-    return c
-
-
-def write_company_header(ws):
-    """Rows 1–15: Header công ty ANH MINH."""
-    today = date.today().strftime('%d/%m/%Y')
-
-    def merge_row(r, text, font_size=11, bold=False):
-        ws.merge_cells(f'A{r}:J{r}')
-        c = ws[f'A{r}']
-        c.value = text
-        c.font = Font(name='Arial', bold=bold, size=font_size)
-        c.alignment = Alignment(horizontal='center', vertical='center')
-        c.border = thin_border()
-        ws.row_dimensions[r].height = max(15, font_size * 1.8)
-
-    merge_row(1,  'ANH MINH', 24, True)
-    merge_row(2,  'TECHNOLOGY TRADING COMPANY LIMITED', 12, True)
-    merge_row(3,  'Add: 179/2 Nguyen Van Troi, Ward 11, Phu Nhuan Dist., Ho Chi Minh City, Vietnam')
-    merge_row(4,  'Tel: (028) 38 44 77 69  |  Fax: (028) 38 44 77 70')
-    merge_row(5,  'Email: info@anhminh.com.vn  |  Tax Code: 0303 657 602')
-    merge_row(6,  'FACSIMILE TRANSMISSION', 14, True)
-
-    # Rows 7–11: Metadata
-    meta = [
-        (7,  f'Ngày/Date: {today}',         'Gởi từ/From: ANH MINH'),
-        (8,  'Số trang/Pages:',              'BG số/Quote No:'),
-        (9,  'Dự án/Project:',               ''),
-        (10, 'Chú ý/Attention:',             ''),
-        (11, 'Điện thoại/Phone:',            ''),
-    ]
-    for r, left_txt, right_txt in meta:
-        ws.merge_cells(f'A{r}:E{r}')
-        ws.merge_cells(f'F{r}:J{r}')
-        for col_range, txt in [('A', left_txt), ('F', right_txt)]:
-            c = ws[f'{col_range}{r}']
-            c.value = txt
-            c.font = Font(name='Arial', size=11)
-            c.border = thin_border()
-            ws.row_dimensions[r].height = 15
-
-    merge_row(12, 'BÁO GIÁ / QUOTATION', 18, True)
-    merge_row(13, 'Kính gởi quý khách hàng, chúng tôi xin trân trọng báo giá như sau:')
-    merge_row(14, 'A  PHẠM VI CÔNG VIỆC / SCOPE OF WORK: Cung cấp thiết bị theo danh mục đính kèm.')
-    merge_row(15, 'B  ĐƠN GIÁ / PRICE: Xem chi tiết bên dưới.')
-
-
-def write_column_header(ws, start_row=16):
-    """Rows 16–18: Header cột."""
-    col_widths = [5.57, 47.71, 15.14, 16.14, 11.29, 12.00, 10.71, 15.43, 6.71, 9.71]
-    col_names  = ['STT', 'MÔ TẢ', 'CHỦNG LOẠI', 'VẬT LIỆU',
-                  'K.THƯỚC 1', 'K.THƯỚC 2', 'TIÊU CHUẨN', 'XUẤT XỨ', 'ĐƠN VỊ', 'SỐ LƯỢNG']
-    from openpyxl.utils import get_column_letter
-    for col_idx, (name, width) in enumerate(zip(col_names, col_widths), 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-        for r in range(start_row, start_row + 3):
-            c = ws.cell(row=r, column=col_idx)
-            c.fill = BG_CYAN
-            c.font = Font(name='Arial', bold=True, size=11, color=FG_RED)
-            c.border = thin_border()
-            c.alignment = Alignment(horizontal='left' if col_idx == 2 else 'center',
-                                    vertical='center', wrap_text=True)
-        ws.merge_cells(start_row=start_row, start_column=col_idx,
-                       end_row=start_row + 2, end_column=col_idx)
-        ws.cell(row=start_row, column=col_idx).value = name
-        ws.row_dimensions[start_row].height = 40
-
-
-def write_section(ws, row, stt, mo_ta, level='major'):
-    bg = BG_CYAN if level == 'major' else BG_YELLOW
-    vals = [stt, mo_ta, '', '', '', '', '', '', '', '']
-    for col, val in enumerate(vals, 1):
-        c = ws.cell(row=row, column=col, value=val)
-        c.fill = bg
-        c.font = Font(name='Arial', bold=True, size=11, color=FG_RED)
-        c.border = thin_border()
-        c.alignment = Alignment(
-            horizontal='left' if col == 2 else 'center',
-            vertical='center', wrap_text=True)
-    ws.row_dimensions[row].height = 18
-
-
-def write_data_row(ws, row, stt, mo_ta, chung_loai, vat_lieu,
-                   kt1, kt2, tieu_chuan, xuat_xu, dv, sl, warn=''):
-    vals = [stt, mo_ta, chung_loai, vat_lieu, kt1, kt2, tieu_chuan, xuat_xu, dv, sl]
-    for col, val in enumerate(vals, 1):
-        c = ws.cell(row=row, column=col, value=val)
-        c.fill = BG_NONE
-        # Cảnh báo → chữ đỏ
-        color = FG_RED if (warn and col == 2) else FG_BLACK
-        c.font = Font(name='Arial', bold=False, size=11, color=color)
-        c.border = thin_border()
-        c.alignment = Alignment(
-            horizontal='left' if col == 2 else 'center',
-            vertical='center', wrap_text=True)
-    # Nếu có warning → ghi vào cột MÔ TẢ
-    if warn:
-        ws.cell(row=row, column=2).value = f'{mo_ta}  {warn}'
-    ws.row_dimensions[row].height = 15
-
-
-def write_footer(ws, row):
-    """Footer: TOTAL, VAT, GRAND TOTAL, notes, conditions."""
-    footer_lines = [
-        ('TOTAL (VND)', True),
-        ('VAT 10% (VND)', True),
-        ('GRAND TOTAL (VND)', True),
-        ('* Ghi chú / Notes:', True),
-        ('- Giá trên chưa bao gồm thuế VAT 10%', False),
-        ('- Không bao gồm chi phí vận chuyển, lắp đặt', False),
-        ('C  ĐIỀU KIỆN BÁN HÀNG / SALES CONDITION:', True),
-        ('-  Địa điểm giao hàng / Delivery: Công trình', False),
-        ('-  Thời gian giao hàng / Lead time: 7-10 tuần kể từ ngày đặt hàng', False),
-        ('-  Thanh toán / Payment: 30% tạm ứng – 40% tập kết – 30% sau hoàn thành', False),
-        ('-  Hiệu lực báo giá / Validity: 30 ngày kể từ ngày gửi báo giá', False),
-        ('Chân thành cảm ơn sự quan tâm của Quý khách hàng!', False),
-        ('Trân trọng kính chào / Best regards,', False),
-    ]
-    for line, bold in footer_lines:
-        ws.merge_cells(f'A{row}:J{row}')
-        c = ws[f'A{row}']
-        c.value = line
-        c.font = Font(name='Arial', bold=bold, size=11,
-                      color=(FG_RED if bold else FG_BLACK))
-        c.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
-        c.border = thin_border()
-        ws.row_dimensions[row].height = 15
-        row += 1
-    return row
-
-
-def build_bom_rows(equipment_list: list) -> tuple[list, list]:
-    """
-    Nhóm thiết bị theo line_type → tạo danh sách bom_rows.
-    Trả về (bom_rows, summary_for_verify).
-    """
-    # Gom theo: line_type → {(desc, act, dn): count}
-    groups = defaultdict(lambda: defaultdict(int))
-    for eq in equipment_list:
-        if eq['equip_info'] is None:
-            continue
-        info = eq['equip_info']
-        line_type = eq['line_type']
-        desc = info['desc']
-        act  = info['act']
-        dn   = eq['dn']
-        spec = eq['spec']
-        key  = (desc, act, dn, spec.get('material',''), spec.get('standard',''),
-                spec.get('connection',''), spec.get('warning',''))
-        groups[line_type][key] += 1
-
-    bom_rows = []
-    section_order = ['sanitary', 'ice_water', 'cooling', 'hot_water',
-                     'steam', 'condensate', 'air', 'water', 'unknown']
-    for lt in section_order:
-        if lt not in groups:
-            continue
-        for key, count in sorted(groups[lt].items(), key=lambda x: x[0][0]):
-            desc, act, dn, mat, std, conn, warn = key
-            bom_rows.append({
-                'line_type': lt,
-                'mo_ta': desc,
-                'chung_loai': act,
-                'vat_lieu': mat,
-                'kt1': dn if dn != '?' else '?',
-                'kt2': '—',
-                'tieu_chuan': conn,
-                'xuat_xu': '',
-                'dv': 'pcs',
-                'sl': count,
-                'warn': warn,
-            })
-    return bom_rows
-
-
-def generate_excel(equipment_list: list, project_name: str = '') -> bytes:
-    """Tạo file Excel BOM đúng chuẩn FORM_BOM_STANDARD."""
+def build_bom_xlsx(rows: list, skill_name: str, project_name: str) -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = 'BOQ'
-    ws.sheet_view.showGridLines = False
+    ws.title = "BOQ"
 
-    # Headers
-    write_company_header(ws)
-    write_column_header(ws, start_row=16)
+    # ── Column widths ─────────────────────────────────────────────
+    col_widths = [5.57, 47.71, 15.14, 16.14, 11.29, 12.00, 10.71, 15.43, 6.71, 9.71]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[chr(64 + i)].width = w
 
-    bom_rows = build_bom_rows(equipment_list)
+    # ── HEADER COMPANY (rows 1–15) ───────────────────────────────
+    header_data = [
+        (1,  "ANHMINH",                                              "A1:J1",  24, True,  "center"),
+        (2,  "TECHNOLOGY TRADING COMPANY LIMITED",                   "A2:J2",  12, True,  "center"),
+        (3,  "Lô C3-7A, Đường số 9, KCN Tân Bình, TP. HCM",         "A3:J3",  11, False, "center"),
+        (4,  "Tel: (028) 2246 6688 | Fax: (028) 2246 6699",          "A4:J4",  11, False, "center"),
+        (5,  "Email: info@anhminh.com.vn | MST: 0315xxxxxx",         "A5:J5",  11, False, "center"),
+        (6,  "FACSIMILE TRANSMISSION",                                "A6:J6",  14, True,  "center"),
+    ]
+    for row_n, text, merge_range, fsize, bold, align in header_data:
+        ws.merge_cells(merge_range)
+        c = ws.cell(row=row_n, column=1, value=text)
+        c.font = Font(name="Arial", bold=bold, size=fsize, color=BLUE)
+        c.alignment = Alignment(horizontal=align, vertical="center")
+        ws.row_dimensions[row_n].height = fsize + 6
 
-    # Ghi dữ liệu bắt đầu từ row 19
-    r = 19
-    write_section(ws, r, 'A', 'PHẦN CƠ KHÍ', level='major')
-    r += 1
+    # ── Meta rows 7–11 ────────────────────────────────────────────
+    from datetime import date
+    meta = [
+        (7,  f"Ngày / Date: {date.today().strftime('%d/%m/%Y')}"),
+        (8,  "Gởi từ / From: ANHMINH"),
+        (9,  "Số trang / Pages: 1"),
+        (10, f"BG số / No.: BOM-{date.today().strftime('%Y%m%d')}"),
+        (11, f"Dự án / Project: {project_name}"),
+    ]
+    for row_n, text in meta:
+        ws.cell(row=row_n, column=1, value=text).font = Font(name="Arial", size=11)
+        ws.merge_cells(f"A{row_n}:J{row_n}")
+        ws.row_dimensions[row_n].height = 15
 
-    section_order = ['sanitary', 'ice_water', 'cooling', 'hot_water',
-                     'steam', 'condensate', 'air', 'water', 'unknown']
-    sub_idx = {lt: i + 1 for i, lt in enumerate(section_order)}
-    roman  = ['I','II','III','IV','V','VI','VII','VIII','IX','X']
+    # Row 12: BÁO GIÁ/QUOTATION
+    ws.merge_cells("A12:J12")
+    c12 = ws.cell(row=12, column=1, value="BÁO GIÁ / QUOTATION")
+    c12.font = Font(name="Arial", bold=True, size=18, color=RED)
+    c12.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[12].height = 28
 
-    current_lt = None
-    item_num = 0
-    for row_data in bom_rows:
-        lt = row_data['line_type']
-        if lt != current_lt:
-            current_lt = lt
-            item_num = 0
-            sub_roman = roman[sub_idx.get(lt, 0) - 1] if sub_idx.get(lt, 0) <= len(roman) else '?'
-            label = LINE_TYPE_LABELS.get(lt, lt)
-            write_section(ws, r, sub_roman, label.split('. ', 1)[-1], level='sub')
-            r += 1
+    # Rows 13–15
+    for row_n, text in [
+        (13, f"Kính gửi Quý khách hàng. Chúng tôi xin trân trọng chào giá các vật tư theo đề mục bên dưới — Skill: {skill_name}."),
+        (14, "A /  PHẠM VI CÔNG VIỆC / SCOPE OF WORK: Cung cấp vật tư, thiết bị theo bản vẽ P&ID."),
+        (15, "B /  ĐƠN GIÁ / PRICE: Theo bảng bên dưới."),
+    ]:
+        ws.merge_cells(f"A{row_n}:J{row_n}")
+        c = ws.cell(row=row_n, column=1, value=text)
+        c.font = Font(name="Arial", bold=(row_n in (14, 15)), size=11)
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws.row_dimensions[row_n].height = 15 if row_n != 13 else 20
 
-        item_num += 1
-        write_data_row(
-            ws, r,
-            stt=str(item_num),
-            mo_ta=row_data['mo_ta'],
-            chung_loai=row_data['chung_loai'],
-            vat_lieu=row_data['vat_lieu'],
-            kt1=row_data['kt1'],
-            kt2=row_data['kt2'],
-            tieu_chuan=row_data['tieu_chuan'],
-            xuat_xu=row_data['xuat_xu'],
-            dv=row_data['dv'],
-            sl=row_data['sl'],
-            warn=row_data['warn'],
-        )
-        r += 1
+    # ── COLUMN HEADER rows 16–18 ──────────────────────────────────
+    col_headers = ["STT", "MÔ TẢ", "CHỦNG LOẠI", "VẬT LIỆU",
+                   "K.THƯỚC 1", "K.THƯỚC 2", "TIÊU CHUẨN", "XUẤT XỨ", "ĐƠN VỊ", "SỐ LƯỢNG"]
+    for r in range(16, 19):
+        for col, hdr in enumerate(col_headers, 1):
+            c = ws.cell(row=r, column=col, value=hdr if r == 16 else "")
+            c.fill   = BG_CYAN
+            c.font   = Font(name="Arial", bold=True, size=11, color=RED)
+            c.border = thin_border()
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.row_dimensions[r].height = 15
+    ws.merge_cells("A16:A18")
+    ws.merge_cells("B16:B18")
+    for col in range(3, 11):
+        ws.merge_cells(f"{chr(64+col)}16:{chr(64+col)}18")
 
-    write_footer(ws, r)
+    # ── DATA rows (19+) ───────────────────────────────────────────
+    current_row = 19
 
-    # Xuất ra bytes
+    def write_section_row(stt, label, level="major"):
+        nonlocal current_row
+        bg = BG_CYAN if level in ("major", "sub") else BG_YELLOW
+        vals = [stt, label] + [""] * 8
+        for col, val in enumerate(vals, 1):
+            c = ws.cell(row=current_row, column=col, value=val)
+            c.fill   = bg
+            c.font   = Font(name="Arial", bold=True, size=11, color=RED)
+            c.border = thin_border()
+            c.alignment = Alignment(
+                horizontal="left" if col == 2 else "center",
+                vertical="center", wrap_text=True,
+            )
+        ws.row_dimensions[current_row].height = 15
+        current_row += 1
+
+    def write_data_row(stt, mo_ta, chung_loai, vat_lieu, kt1, kt2,
+                       tieu_chuan, xuat_xu, don_vi, so_luong):
+        nonlocal current_row
+        vals = [stt, mo_ta, chung_loai, vat_lieu, kt1, kt2,
+                tieu_chuan, xuat_xu, don_vi, so_luong]
+        for col, val in enumerate(vals, 1):
+            c = ws.cell(row=current_row, column=col, value=val)
+            c.fill   = BG_YELLOW
+            c.font   = Font(name="Arial", bold=True, size=11, color=RED)
+            c.border = thin_border()
+            c.alignment = Alignment(
+                horizontal="left" if col == 2 else "center",
+                vertical="center", wrap_text=True,
+            )
+        ws.row_dimensions[current_row].height = 15
+        current_row += 1
+
+    # ── Group rows by section ─────────────────────────────────────
+    grouped = defaultdict(list)
+    for r in rows:
+        grouped[r["section"]].append(r)
+
+    write_section_row("A", "PHẦN CƠ KHÍ / MECHANICAL PART", level="major")
+
+    stt_roman = ["I", "II", "III", "IV", "V", "VI", "VII"]
+    roman_idx = 0
+
+    for sec in SECTION_ORDER:
+        if sec not in grouped:
+            continue
+        sec_rows = grouped[sec]
+        if not sec_rows:
+            continue
+
+        sec_label = SECTION_LABELS.get(sec, sec.upper())
+        write_section_row(stt_roman[roman_idx], sec_label, level="sub")
+        roman_idx += 1
+
+        item_idx = 1
+        for r in sec_rows:
+            write_data_row(
+                str(item_idx),
+                r["mo_ta"],
+                r["chung_loai"],
+                r["vat_lieu"],
+                r["kt1"],
+                r["kt2"],
+                r["tieu_chuan"],
+                r["xuat_xu"],
+                r["don_vi"],
+                r["so_luong"],
+            )
+            item_idx += 1
+
+    # ── FOOTER ───────────────────────────────────────────────────
+    for label in ["TOTAL (VND)", "VAT 10% (VND)", "GRAND TOTAL (VND)"]:
+        ws.merge_cells(f"A{current_row}:J{current_row}")
+        c = ws.cell(row=current_row, column=1, value=label)
+        c.font  = Font(name="Arial", bold=True, size=11)
+        c.border = thin_border()
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[current_row].height = 15
+        current_row += 1
+
+    footer_notes = [
+        "* Ghi chú / Notes:",
+        "- Giá này không bao gồm thuế VAT 10%.",
+        "- Không bao gồm chi phí vận chuyển, lắp đặt.",
+        "C  ĐIỀU KIỆN BÁN HÀNG / SALES CONDITION:",
+        "-  Địa điểm giao hàng / Delivery destination: Tại kho ANHMINH, TP. HCM",
+        "-  Thời gian giao hàng / Lead time: 7-10 tuần",
+        "-  Điều kiện thanh toán / Payment term: 30% tạm ứng – 40% tập kết – 30% sau khi hoàn thành",
+        "-  Thời hạn chào giá / Validity until: 30 ngày kể từ ngày gửi báo giá",
+        "Chân thành cảm ơn Quý khách hàng đã tin tưởng và hợp tác.",
+        "Trân trọng kính chào / Best regards,",
+        "ANHMINH Technology Trading Company Limited",
+    ]
+    for note in footer_notes:
+        ws.merge_cells(f"A{current_row}:J{current_row}")
+        c = ws.cell(row=current_row, column=1, value=note)
+        bold = note.startswith(("*", "C "))
+        color = RED if note.startswith("*") else BLACK
+        c.font = Font(name="Arial", bold=bold, size=10, color=color)
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws.row_dimensions[current_row].height = 13
+        current_row += 1
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf.read()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 7. STREAMLIT UI
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  STREAMLIT UI
+# ═══════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title='P&ID BOM Generator — ANH MINH',
-    page_icon='🔧',
-    layout='wide',
+    page_title="P&ID BOM Extractor — ANH MINH",
+    page_icon="🔧",
+    layout="wide",
 )
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
+# ── Custom CSS ────────────────────────────────────────────────────
 st.markdown("""
 <style>
-  .stApp { background: #f7f9fc; }
-  .block-label { font-weight:600; color:#1a237e; }
-  .warn-box { background:#fff3cd; border-left:4px solid #ffc107;
-              padding:8px 12px; border-radius:4px; margin:4px 0; font-size:13px; }
-  .ok-box   { background:#d4edda; border-left:4px solid #28a745;
-              padding:8px 12px; border-radius:4px; margin:4px 0; font-size:13px; }
-  .err-box  { background:#f8d7da; border-left:4px solid #dc3545;
-              padding:8px 12px; border-radius:4px; margin:4px 0; font-size:13px; }
-  .info-box { background:#d1ecf1; border-left:4px solid #17a2b8;
-              padding:8px 12px; border-radius:4px; margin:4px 0; font-size:13px; }
-  h1 { color:#1a237e !important; }
-  h2 { color:#283593 !important; }
-  h3 { color:#3949ab !important; }
+    .main-title {
+        font-size: 2.2rem; font-weight: 800;
+        color: #003399; margin-bottom: 0;
+    }
+    .sub-title {
+        font-size: 1rem; color: #666; margin-top: 0;
+    }
+    .stDataFrame thead th {background-color:#00FFFF; color:#FF0000; font-weight:bold;}
+    .section-header {
+        background: #00FFFF; color: #FF0000;
+        font-weight: 700; padding: 6px 12px;
+        border-radius: 4px; margin: 12px 0 4px 0;
+    }
+    .unknown-box {
+        background: #FFF3CD; border-left: 4px solid #FFA500;
+        padding: 8px 12px; border-radius: 4px; margin-top: 8px;
+        font-size: 0.88rem;
+    }
+    .warn-box {
+        background: #F8D7DA; border-left: 4px solid #DC3545;
+        padding: 8px 12px; border-radius: 4px; margin-top: 8px;
+        font-size: 0.88rem;
+    }
+    .success-box {
+        background: #D4EDDA; border-left: 4px solid #28A745;
+        padding: 8px 12px; border-radius: 4px; margin-top: 8px;
+        font-size: 0.88rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-st.title('🔧 P&ID BOM Generator — ANH MINH')
-st.caption('Tuân thủ: pid-reader-SPX + pid-reader-TPV | ANH MINH 2021')
-st.markdown('---')
+# ── TITLE ─────────────────────────────────────────────────────────
+st.markdown('<div class="main-title">🔧 P&ID BOM Extractor</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">ANH MINH 2021 Standard — SPX / Tetra Pak | Rule-based · No AI cost</div>',
+            unsafe_allow_html=True)
+st.markdown("---")
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── SIDEBAR CONFIG ────────────────────────────────────────────────
 with st.sidebar:
-    st.header('⚙️ Cài đặt')
-    project_name = st.text_input('Tên dự án', placeholder='ANHMINH-2025-XXX')
-    max_dist = st.slider('Ngưỡng proximity (max_dist)', 50, 1000, 300, 50,
-                         help='Khoảng cách tối đa (DXF units) để gán size cho thiết bị')
-    show_unknown = st.checkbox('Hiển thị block chưa nhận diện', value=True)
-    show_linenames = st.checkbox('Hiển thị linename blocks', value=True)
+    st.header("⚙️ Cấu hình")
+    skill_choice = st.radio(
+        "Chọn tiêu chuẩn P&ID:",
+        ["SPX Type (ANH MINH 2021)", "Tetra Pak Type (ANH MINH 2021)"],
+        help="SPX dùng SV41/43/44/42. Tetra Pak có thêm Leakage Valve, Screw Pump, Angle Filter.",
+    )
+    project_name = st.text_input("Tên dự án", value="ANHMINH Project 2025")
+    st.markdown("---")
+    st.markdown("**Quy tắc xác định size:**")
+    st.markdown(f"• Tìm chú thích DN gần thiết bị nhất  \n• Ngưỡng tối đa: **{MAX_DIST} đơn vị DXF**  \n• Nếu không tìm thấy → ghi `?`")
+    st.markdown("---")
+    st.markdown("**Quy tắc nhận diện thiết bị:**")
+    st.markdown("• Đọc **Block Name** từ DXF  \n• So khớp không phân biệt thứ tự từ  \n• Không đoán, không dùng AI")
 
-    st.markdown('---')
-    st.subheader('📋 Quy tắc áp dụng')
-    st.markdown("""
-**Quy tắc 1 — Xác định Line trước**
-- Đọc block `linename TPV-left`
-- PRD/CIP/PW → Vi sinh (SS316L/SMS)
-- IW/IWR → Chiller (Cast Iron / Brass)
-- CW/TWR → Cooling (Cast Iron / Brass)
-- STM/S → Steam (Cast Iron / Carbon Steel)
+library_map = {
+    "SPX Type (ANH MINH 2021)": SPX_LIBRARY,
+    "Tetra Pak Type (ANH MINH 2021)": TPK_LIBRARY,
+}
+selected_library = library_map[skill_choice]
 
-**Quy tắc 2 — Size < DN50 → Thread end**
-- DN < 50 → Thread end
-- DN ≥ 50 → Flange (PN16 / JIS10K)
-- *Chỉ áp dụng thiết bị công nghiệp*
-    """)
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-st.subheader('📂 Upload file DXF')
+# ── FILE UPLOAD ───────────────────────────────────────────────────
 uploaded = st.file_uploader(
-    'Chọn file P&ID (.dxf)',
-    type=['dxf'],
-    help='File DXF bản vẽ P&ID theo chuẩn ANH MINH 2021 (SPX hoặc Tetra Pak)'
+    "📂 Upload file DXF (P&ID bản vẽ)",
+    type=["dxf"],
+    help="Chỉ hỗ trợ định dạng .dxf. File sẽ được xử lý hoàn toàn cục bộ.",
 )
 
 if uploaded is None:
-    st.markdown("""
-<div class="info-box">
-ℹ️ Vui lòng upload file DXF P&ID.<br>
-App sẽ tự động:<br>
-&nbsp;1. Đọc <b>block linename TPV-left</b> → xác định loại đường<br>
-&nbsp;2. Đọc <b>block name</b> thiết bị → nhận diện loại van/pump<br>
-&nbsp;3. Đọc <b>size</b> gần nhất (proximity detection, max_dist=300)<br>
-&nbsp;4. Áp spec: DN&lt;50 → Thread end; DN≥50 → Flange<br>
-&nbsp;5. Xuất BOM chuẩn <b>FORM_BOM_STANDARD</b> (.xlsx)
-</div>
-""", unsafe_allow_html=True)
+    st.info("⬆️  Vui lòng upload file DXF để bắt đầu trích xuất BOM.")
     st.stop()
 
-# ── Parse ─────────────────────────────────────────────────────────────────────
-with st.spinner('🔍 Đang đọc file DXF...'):
-    file_bytes = uploaded.read()
-    result = parse_dxf(file_bytes)
+# ── PARSE DXF ─────────────────────────────────────────────────────
+with st.spinner("🔍 Đang phân tích file DXF…"):
+    try:
+        dxf_bytes = uploaded.read()
+        rows, unknowns, size_texts, warnings = parse_dxf(dxf_bytes, selected_library)
+    except Exception as exc:
+        st.error(f"❌ Lỗi đọc file DXF: {exc}")
+        st.stop()
 
-# ── Errors ────────────────────────────────────────────────────────────────────
-if result['errors']:
-    for e in result['errors']:
-        st.markdown(f'<div class="err-box">❌ {e}</div>', unsafe_allow_html=True)
-    st.stop()
+total_eq   = sum(r["so_luong"] for r in rows)
+total_types = len(set(r["block_name"] for r in rows))
 
-linenames = result['linenames']
-equipment = result['equipment']
-size_ann  = result['size_annotations']
-unknowns  = result['unknown_blocks']
-
-# ── Summary cards ─────────────────────────────────────────────────────────────
+# ── SUMMARY METRICS ───────────────────────────────────────────────
 col1, col2, col3, col4 = st.columns(4)
-col1.metric('Line names đọc được', len(linenames))
-col2.metric('Thiết bị tìm thấy', len(equipment))
-col3.metric('Size annotations', len(size_ann))
-col4.metric('Block chưa nhận diện', len(unknowns))
+col1.metric("📦 Tổng thiết bị", total_eq)
+col2.metric("🔢 Loại block", total_types)
+col3.metric("📐 Chú thích size", len(size_texts))
+col4.metric("❓ Block chưa nhận diện", len(unknowns))
 
-st.markdown('---')
+st.markdown("---")
 
-# ── Tab layout ────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(
-    ['📋 Line Names', '⚙️ Thiết bị', '⚠️ Kiểm tra', '📥 Xuất BOM']
-)
+# ── WARNINGS ─────────────────────────────────────────────────────
+if warnings:
+    with st.expander(f"⚠️ {len(warnings)} cảnh báo size chưa xác định", expanded=False):
+        for w in warnings:
+            st.markdown(f'<div class="warn-box">{w}</div>', unsafe_allow_html=True)
 
-# ── Tab 1: Linenames ──────────────────────────────────────────────────────────
-with tab1:
-    st.subheader('Block Linename TPV-left / TP-left')
-    if not linenames:
-        st.markdown("""
-<div class="warn-box">
-⚠️ Không tìm thấy block linename trong file DXF.<br>
-Kiểm tra tên block: app tìm các block chứa keyword
-<code>linename</code>, <code>tpleft</code>, <code>tpvleft</code>.
-</div>
-""", unsafe_allow_html=True)
-    else:
-        import pandas as pd
-        df_ln = pd.DataFrame(linenames)
-        df_ln['line_type_label'] = df_ln['line_type'].map(
-            lambda lt: LINE_TYPE_LABELS.get(lt, lt))
-        df_ln = df_ln[['name', 'line_type_label', 'x', 'y']].rename(columns={
-            'name': 'Tên line', 'line_type_label': 'Loại đường',
-            'x': 'X', 'y': 'Y'
-        })
-        st.dataframe(df_ln, use_container_width=True, height=400)
+if unknowns:
+    with st.expander(f"❓ {len(unknowns)} block name chưa có trong thư viện ({skill_choice})", expanded=False):
+        for u in unknowns:
+            st.markdown(f'<div class="unknown-box">🔷 <code>{u}</code></div>', unsafe_allow_html=True)
+        st.caption("Các block này vẫn được xuất vào BOM với mô tả 'UNKNOWN'. Hãy kiểm tra và thêm vào thư viện nếu cần.")
 
-# ── Tab 2: Equipment ──────────────────────────────────────────────────────────
-with tab2:
-    st.subheader('Danh sách thiết bị được nhận diện')
+# ── BOM PREVIEW ───────────────────────────────────────────────────
+st.subheader("📋 Xem trước BOM")
 
-    # Filters
-    col_a, col_b = st.columns(2)
-    filter_lt = col_a.multiselect(
-        'Lọc theo loại đường',
-        options=list(LINE_TYPE_LABELS.keys()),
-        format_func=lambda x: LINE_TYPE_LABELS.get(x, x)
+# Group by section
+grouped = defaultdict(list)
+for r in rows:
+    grouped[r["section"]].append(r)
+
+all_preview_rows = []
+for sec in SECTION_ORDER:
+    if sec not in grouped:
+        continue
+    sec_label = SECTION_LABELS.get(sec, sec.upper())
+    st.markdown(f'<div class="section-header">▸ {sec_label}</div>', unsafe_allow_html=True)
+    sec_data = grouped[sec]
+    df_sec = pd.DataFrame([{
+        "STT":        i + 1,
+        "Mô tả":      r["mo_ta"],
+        "Chủng loại": r["chung_loai"],
+        "Vật liệu":   r["vat_lieu"],
+        "K.Thước":    r["kt1"],
+        "Tiêu chuẩn": r["tieu_chuan"],
+        "Đơn vị":     r["don_vi"],
+        "Số lượng":   r["so_luong"],
+    } for i, r in enumerate(sec_data)])
+    st.dataframe(df_sec, use_container_width=True, hide_index=True)
+    all_preview_rows.extend(sec_data)
+
+# ── VERIFICATION SUMMARY ──────────────────────────────────────────
+st.markdown("---")
+passed = all(r["kt1"] != "?" for r in rows if r["section"] != "unknown")
+if passed and not unknowns:
+    st.markdown('<div class="success-box">✅ BOM đã kiểm tra: tất cả thiết bị đã có size — PASS</div>',
+                unsafe_allow_html=True)
+elif passed:
+    st.markdown(f'<div class="unknown-box">⚠️ BOM PASS về size, nhưng có {len(unknowns)} block chưa nhận diện.</div>',
+                unsafe_allow_html=True)
+else:
+    st.markdown('<div class="warn-box">⚠️ Một số thiết bị chưa xác định được size (size = ?). Kiểm tra lại bản vẽ.</div>',
+                unsafe_allow_html=True)
+
+# ── EXPORT ───────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("📥 Xuất BOM")
+
+col_dl1, col_dl2 = st.columns([1, 3])
+with col_dl1:
+    if st.button("⚙️ Tạo file BOM Excel", type="primary", use_container_width=True):
+        with st.spinner("Đang tạo file xlsx…"):
+            xlsx_bytes = build_bom_xlsx(rows, skill_choice, project_name)
+        st.session_state["xlsx_bytes"] = xlsx_bytes
+        st.success("✅ File đã sẵn sàng!")
+
+if "xlsx_bytes" in st.session_state:
+    from datetime import date
+    fname = f"BOM_{project_name.replace(' ','_')}_{date.today().strftime('%Y%m%d')}.xlsx"
+    col_dl2.download_button(
+        label="⬇️  Tải xuống BOM.xlsx",
+        data=st.session_state["xlsx_bytes"],
+        file_name=fname,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
     )
-    filter_known = col_b.radio(
-        'Hiển thị',
-        ['Tất cả', 'Đã nhận diện', 'Chưa nhận diện'],
-        horizontal=True
-    )
 
-    import pandas as pd
-    rows = []
-    for eq in equipment:
-        info = eq['equip_info']
-        spec = eq['spec']
-        known = info is not None
-        if filter_lt and eq['line_type'] not in filter_lt:
-            continue
-        if filter_known == 'Đã nhận diện' and not known:
-            continue
-        if filter_known == 'Chưa nhận diện' and known:
-            continue
-
-        dn_flag = '✅' if eq['dn'] != '?' else '❓'
-        warn = spec.get('warning', '') if spec else ''
-        rows.append({
-            'Block Name': eq['block_name'],
-            'Thiết bị': info['desc'] if info else '— UNKNOWN —',
-            'Chủng loại': info['act'] if info else '',
-            'Loại đường': LINE_TYPE_LABELS.get(eq['line_type'], eq['line_type']),
-            'Line code': eq['line_name'],
-            f'Size {dn_flag}': eq['dn'],
-            'Vật liệu': spec.get('material', '') if spec else '',
-            'Tiêu chuẩn': spec.get('connection', '') if spec else '',
-            '⚠️': '⚠️' if warn else '',
-        })
-
-    if rows:
-        df_eq = pd.DataFrame(rows)
-        st.dataframe(df_eq, use_container_width=True, height=500)
-        st.caption(f'Tổng: {len(rows)} thiết bị hiển thị')
-    else:
-        st.info('Không có thiết bị nào thỏa điều kiện lọc.')
-
-    # Unknown blocks
-    if show_unknown and unknowns:
-        with st.expander(f'🔍 {len(unknowns)} block chưa nhận diện'):
-            st.markdown('Các tên block dưới đây không khớp với thư viện thiết bị:')
-            for ub in sorted(unknowns):
-                st.code(ub)
-            st.markdown("""
-<div class="info-box">
-💡 Nếu block là thiết bị thực sự, hãy thêm vào <code>EQUIPMENT_LIBRARY</code>
-hoặc liên hệ để cập nhật skill.
-</div>
-""", unsafe_allow_html=True)
-
-# ── Tab 3: Verification ───────────────────────────────────────────────────────
-with tab3:
-    st.subheader('🔍 Kỹ năng 2 — Tự kiểm tra BOM (Post-export Verification)')
-
-    bom_rows_preview = build_bom_rows(equipment)
-    verify_errors = verify_bom(equipment, bom_rows_preview)
-
-    if not verify_errors:
-        st.markdown(f"""
-<div class="ok-box">
-✅ BOM đã kiểm tra: {len(set(eq.get('equip_info', {}).get('desc','') for eq in equipment if eq['equip_info']))} loại thiết bị,
-tổng {len([eq for eq in equipment if eq['equip_info']])} EA — <b>PASS</b>
-</div>
-""", unsafe_allow_html=True)
-    else:
-        st.markdown(f'<div class="err-box">❌ Phát hiện {len(verify_errors)} lỗi — cần kiểm tra:</div>',
-                    unsafe_allow_html=True)
-        for err in verify_errors:
-            icon = '❌' if err.startswith('❌') else '⚠️'
-            css_class = 'err-box' if icon == '❌' else 'warn-box'
-            st.markdown(f'<div class="{css_class}">{err}</div>', unsafe_allow_html=True)
-
-    # Warnings về line type
-    unknown_line_eqs = [eq for eq in equipment if eq['line_type'] == 'unknown' and eq['equip_info']]
-    if unknown_line_eqs:
-        st.markdown('---')
-        st.markdown(f'<div class="warn-box">⚠️ {len(unknown_line_eqs)} thiết bị chưa xác định được loại đường — spec có thể sai.</div>',
-                    unsafe_allow_html=True)
-
-    # Globe valve warnings
-    globe_water_warn = [
-        eq for eq in equipment
-        if eq['spec'] and '⚠️' in eq['spec'].get('warning', '')
-    ]
-    if globe_water_warn:
-        st.markdown('---')
-        st.warning(f'⚠️ Phát hiện {len(globe_water_warn)} trường hợp vi phạm quy tắc đường nước (Globe Valve trên đường IW/CW):')
-        for eq in globe_water_warn:
-            st.markdown(f'- **{eq["block_name"]}** tại ({eq["x"]:.0f}, {eq["y"]:.0f}) trên line `{eq["line_name"]}`')
-
-    # Stats
-    st.markdown('---')
-    st.subheader('📊 Thống kê nhanh')
-    import pandas as pd
-
-    summary_data = defaultdict(lambda: defaultdict(int))
-    for eq in equipment:
-        if eq['equip_info']:
-            lt_label = LINE_TYPE_LABELS.get(eq['line_type'], eq['line_type'])
-            dn = eq['dn']
-            summary_data[lt_label][dn] += 1
-
-    if summary_data:
-        for lt_label, sizes in summary_data.items():
-            total = sum(sizes.values())
-            unknown_sz = sizes.get('?', 0)
-            pct_ok = int((total - unknown_sz) / total * 100) if total else 0
-            st.markdown(f'**{lt_label}** — {total} thiết bị | Size OK: {pct_ok}%')
-            size_df = pd.DataFrame(
-                [{'Size': k, 'Số lượng': v} for k, v in sorted(sizes.items())]
-            )
-            st.dataframe(size_df, use_container_width=False, height=None)
-
-
-# ── Tab 4: Export BOM ─────────────────────────────────────────────────────────
-with tab4:
-    st.subheader('📥 Xuất BOM — FORM_BOM_STANDARD')
-
-    # Preview
-    bom_rows_final = build_bom_rows(equipment)
-    if not bom_rows_final:
-        st.warning('Không có dữ liệu thiết bị để xuất BOM. Kiểm tra lại file DXF.')
-    else:
-        import pandas as pd
-        df_bom = pd.DataFrame([{
-            'STT': '',
-            'Loại đường': LINE_TYPE_LABELS.get(r['line_type'], r['line_type']),
-            'Mô tả': r['mo_ta'],
-            'Chủng loại': r['chung_loai'],
-            'Vật liệu': r['vat_lieu'],
-            'K.Thước 1': r['kt1'],
-            'Tiêu chuẩn': r['tieu_chuan'],
-            'ĐV': r['dv'],
-            'SL': r['sl'],
-            '⚠️': r['warn'][:30] if r['warn'] else '',
-        } for r in bom_rows_final])
-
-        st.markdown('**Preview BOM:**')
-        st.dataframe(df_bom, use_container_width=True, height=400)
-        st.caption(f'Tổng: {len(bom_rows_final)} dòng vật tư | '
-                   f'{sum(r["sl"] for r in bom_rows_final)} EA')
-
-        # Check có unknown size không
-        unk_sz = sum(1 for r in bom_rows_final if r['kt1'] == '?')
-        if unk_sz:
-            st.markdown(f"""
-<div class="warn-box">
-⚠️ {unk_sz} dòng có size = '?' — không xác định được từ bản vẽ.<br>
-Ô K.THƯỚC sẽ để trống — cần kiểm tra thủ công trước khi gửi báo giá.
-</div>
-""", unsafe_allow_html=True)
-
-        st.markdown('---')
-        # Export button
-        xlsx_bytes = generate_excel(equipment, project_name)
-        fname = f'BOM_{project_name or "output"}_{date.today().strftime("%Y%m%d")}.xlsx'
-
-        st.download_button(
-            label='⬇️  Tải xuống BOM Excel (FORM_BOM_STANDARD)',
-            data=xlsx_bytes,
-            file_name=fname,
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            type='primary',
-        )
-
-        st.markdown("""
-<div class="info-box">
-📌 File Excel tuân thủ chuẩn <b>FORM_BOM_STANDARD</b> của ANH MINH:<br>
-&nbsp;• Rows 1–15: Header công ty<br>
-&nbsp;• Rows 16–18: Header cột (nền Cyan, chữ Đỏ)<br>
-&nbsp;• Row 19+: Dữ liệu theo đề mục (Major=Cyan / Sub=Yellow / Item=White)<br>
-&nbsp;• Footer: TOTAL / VAT 10% / GRAND TOTAL + Điều kiện bán hàng
-</div>
-""", unsafe_allow_html=True)
-
-st.markdown('---')
-st.caption('P&ID BOM Generator v1.0 | Tuân thủ pid-reader-SPX + pid-reader-TPV | ANH MINH 2021')
+st.caption("ANHMINH 2021 Standard | P&ID BOM Extractor v1.0 | Không tốn API cost — 100% rule-based")
