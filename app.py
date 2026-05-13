@@ -84,36 +84,26 @@ with st.spinner("Đang đọc file DXF..."):
     finally:
         os.unlink(tmp_path)
 
-# ── Lines detected ─────────────────────────────────────────────────────────────
-st.subheader("2. Lines phát hiện")
-if not result.lines:
-    st.warning("Không tìm thấy block `linename TP-left`. Tất cả thiết bị sẽ được gán là UNKNOWN.")
-else:
-    df_lines = pd.DataFrame([
-        {
-            "Line ID": l.line_id,
-            "Loại đường": l.line_type,
-            "Nhóm BOM": get_line_category(l.line_type),
-            "X": round(l.x, 1),
-            "Y": round(l.y, 1),
-        }
-        for l in result.lines
-    ])
-    # Màu theo loại
-    def color_line(val):
-        c = {
-            "SANITARY":  "#d4edda",
-            "ICE_WATER": "#cce5ff",
-            "COOLING":   "#d1ecf1",
-            "STEAM":     "#fff3cd",
-            "AIR":       "#e2e3e5",
-        }
-        return f"background-color: {c.get(val, '#fff')}"
-
-    st.dataframe(
-        df_lines.style.map(color_line, subset=["Loại đường"]),
-        use_container_width=True, height=200
-    )
+# ── Line type summary ─────────────────────────────────────────────────────────
+st.subheader("2. Phân bố loại đường ống")
+if result.equipment:
+    from collections import Counter
+    lt_counts = Counter(eq.line_type for eq in result.equipment)
+    col_a, col_b, col_c, col_d, col_e = st.columns(5)
+    for col, (lt, label, color) in zip(
+        [col_a, col_b, col_c, col_d, col_e],
+        [("SANITARY","Sanitary","#d4edda"),
+         ("ICE_WATER","Ice Water","#cce5ff"),
+         ("COOLING","Cooling","#d1ecf1"),
+         ("STEAM","Steam","#fff3cd"),
+         ("UNKNOWN","Unknown","#f8d7da")]
+    ):
+        n = lt_counts.get(lt, 0)
+        col.markdown(
+            f'<div style="background:{color};padding:8px;border-radius:6px;text-align:center">' +
+            f'<b>{label}</b><br><span style="font-size:1.5rem">{n}</span></div>',
+            unsafe_allow_html=True
+        )
 
 # ── Equipment detected ─────────────────────────────────────────────────────────
 st.subheader("3. Thiết bị phát hiện")

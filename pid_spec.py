@@ -333,3 +333,60 @@ def is_linename_block(block_name: str) -> bool:
         if p in nk:
             return True
     return False
+
+
+# ── 7. CLASSIFY LINE FROM RAW TEXT ────────────────────────────────────────────
+# (dùng cho BFS segment tracing)
+
+# (score, line_type, pattern)
+# Score cao hơn = độ tin cậy cao hơn
+_TEXT_RULES = [
+    # ── Line ID dạng PREFIX-NUMBER (score 10) ─────────────────────────────────
+    (10, "SANITARY",  re.compile(r'\b(PRD|PRODUCT|CIP|PW|SS|RO)[-_]\d+', re.I)),
+    (10, "ICE_WATER", re.compile(r'\b(IW|IWR)[-_]\d+', re.I)),
+    (10, "COOLING",   re.compile(r'\b(CW|CWR|TW|TWR|HW|HWR)[-_]\d+', re.I)),
+    (10, "STEAM",     re.compile(r'\b(STM|STEAM|S|C|COND|CON)[-_]\d+', re.I)),
+    (10, "AIR",       re.compile(r'\b(IA|SA|CA)[-_]\d+', re.I)),
+
+    # ── Keyword rõ (score 5) ──────────────────────────────────────────────────
+    (5,  "ICE_WATER", re.compile(r'\bICE\s*WATER\b|\bIW\b|\bCHILLER\b', re.I)),
+    (5,  "COOLING",   re.compile(r'\bCOOLING\s*WATER\b|\bCOOL\b|\bTOWER\s*WATER\b', re.I)),
+    (5,  "STEAM",     re.compile(r'\bSTEAM\b|\bCONDENSATE\b|\bSTM\b', re.I)),
+    (5,  "SANITARY",  re.compile(r'\bPRODUCT\b|\bCIP\b|\bPROCESS\b|\bPW\b|\bSANITARY\b', re.I)),
+    (5,  "AIR",       re.compile(r'\bINSTRUMENT\s*AIR\b|\bSANITARY\s*AIR\b|\b\bIA\b|\bSA\b', re.I)),
+
+    # ── Prefix đứng một mình (score 3) ───────────────────────────────────────
+    (3,  "ICE_WATER", re.compile(r'^\s*(IW|IWR)\s*$', re.I)),
+    (3,  "COOLING",   re.compile(r'^\s*(CW|CWR|TW|HW)\s*$', re.I)),
+    (3,  "STEAM",     re.compile(r'^\s*(STM|S|C)\s*$', re.I)),
+    (3,  "SANITARY",  re.compile(r'^\s*(PRD|CIP|PW|SS|RO)\s*$', re.I)),
+    (3,  "AIR",       re.compile(r'^\s*(IA|SA|CA)\s*$', re.I)),
+]
+
+_LINE_ID_RE = re.compile(
+    r'\b([A-Z]{1,6})[-_](\d+)\b', re.I
+)
+
+
+def classify_line_from_text(raw_text: str) -> tuple[str, str, int]:
+    """
+    Phân loại line type từ text thô.
+    Trả về (line_type, line_id, score).
+    score = 0 → UNKNOWN, score cao hơn → tin cậy hơn.
+    """
+    if not raw_text:
+        return "UNKNOWN", "", 0
+
+    text = raw_text.strip()
+    best_type, best_id, best_score = "UNKNOWN", "", 0
+
+    for score, lt, pattern in _TEXT_RULES:
+        m = pattern.search(text)
+        if m and score > best_score:
+            best_score = score
+            best_type  = lt
+            # Thử extract line ID
+            mid = _LINE_ID_RE.search(text)
+            best_id = mid.group(0).upper() if mid else lt
+
+    return best_type, best_id, best_score
