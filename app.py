@@ -111,7 +111,7 @@ else:
         return f"background-color: {c.get(val, '#fff')}"
 
     st.dataframe(
-        df_lines.style.applymap(color_line, subset=["Loại đường"]),
+        df_lines.style.map(color_line, subset=["Loại đường"]),
         use_container_width=True, height=200
     )
 
