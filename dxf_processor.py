@@ -1,9 +1,18 @@
 """
 dxf_processor.py
 Orchestrator: đọc DXF → trích INSERT → xác định line + size → tra spec → trả list items.
+
+Ghi chú tọa độ:
+  AutoCAD hiển thị tọa độ theo UCS (User Coordinate System).
+  ezdxf đọc tọa độ theo WCS (World Coordinate System).
+  Nếu bản vẽ dùng custom UCS (origin offset, trục lật...) thì 2 hệ lệch nhau
+  → dẫn đến dấu bị đảo hoặc tọa độ sai so với màn hình AutoCAD.
+  Fix: đọc UCS từ DXF header ($UCSORG / $UCSXDIR / $UCSYDIR) rồi
+  transform WCS → UCS để tọa độ khớp với màn hình.
 """
 import re
 import ezdxf
+from ezdxf.math import Vec3, Matrix44
 
 from line_detector import (
     build_layer_colors, collect_pipes, detect_line_for_insert, IGNORE_BLOCKS,
@@ -17,6 +26,47 @@ def _dn_num(dn_str: str) -> int:
     return int(m.group()) if m else -1
 
 
+def build_wcs_to_ucs(doc) -> Matrix44:
+    """
+    Đọc UCS hiện hành từ DXF header và trả về ma trận chuyển WCS → UCS.
+    Nếu không có UCS header (bản vẽ dùng WCS mặc định) → trả về identity.
+    """
+    hdr = doc.header
+    origin = Vec3(hdr.get("$UCSORG",  (0.0, 0.0, 0.0)))
+    x_axis = Vec3(hdr.get("$UCSXDIR", (1.0, 0.0, 0.0)))
+    y_axis = Vec3(hdr.get("$UCSYDIR", (0.0, 1.0, 0.0)))
+
+    # Kiểm tra UCS có phải WCS mặc định không
+    is_default = (
+        origin.isclose((0, 0, 0), abs_tol=1e-6)
+        and x_axis.isclose((1, 0, 0), abs_tol=1e-6)
+        and y_axis.isclose((0, 1, 0), abs_tol=1e-6)
+    )
+    if is_default:
+        return Matrix44()  # identity — không cần transform
+
+    # Xây ma trận rotation từ trục UCS (UCS axes in WCS)
+    z_axis = x_axis.cross(y_axis).normalize()
+    # Ma trận chuyển WCS point P_wcs → P_ucs:
+    #   P_ucs = R^T * (P_wcs - origin)
+    # R^T rows = [x_axis, y_axis, z_axis]
+    # Matrix44 nhận flat list 16 phần tử (row-major)
+    rot_inv = Matrix44([
+        x_axis.x, x_axis.y, x_axis.z, 0.0,
+        y_axis.x, y_axis.y, y_axis.z, 0.0,
+        z_axis.x, z_axis.y, z_axis.z, 0.0,
+        0.0,      0.0,      0.0,      1.0,
+    ])
+    translate = Matrix44.translate(-origin.x, -origin.y, -origin.z)
+    return rot_inv @ translate
+
+
+def wcs_to_ucs(pt_wcs: tuple, m: Matrix44) -> tuple:
+    """Chuyển 1 điểm WCS sang UCS."""
+    p = m.transform(Vec3(pt_wcs))
+    return (p.x, p.y)
+
+
 def process_dxf(dxf_path: str, progress_cb=None) -> tuple:
     """
     Đọc file DXF và trả về:
@@ -27,19 +77,22 @@ def process_dxf(dxf_path: str, progress_cb=None) -> tuple:
     msp = doc.modelspace()
 
     if progress_cb:
-        progress_cb("Đang đọc layer colors...", 0.05)
+        progress_cb("Đang đọc UCS & layer colors...", 0.05)
+
+    # Ma trận WCS → UCS (fix tọa độ khớp với màn hình AutoCAD)
+    wcs2ucs = build_wcs_to_ucs(doc)
 
     layer_colors = build_layer_colors(doc)
 
     if progress_cb:
         progress_cb("Đang thu thập đường ống...", 0.15)
 
-    pipes = collect_pipes(msp, layer_colors)
+    pipes = collect_pipes(msp, layer_colors, wcs2ucs)
 
     if progress_cb:
         progress_cb("Đang thu thập annotation size...", 0.25)
 
-    annotations = collect_size_annotations(msp)
+    annotations = collect_size_annotations(msp, wcs2ucs)
 
     if progress_cb:
         progress_cb("Đang xử lý INSERT blocks...", 0.40)
@@ -57,8 +110,10 @@ def process_dxf(dxf_path: str, progress_cb=None) -> tuple:
             continue
         if not block_name.strip():
             continue
-        pos = e.dxf.insert
-        inserts.append({"block_name": block_name, "x": pos.x, "y": pos.y})
+        # Đọc tọa độ WCS từ dxf.insert rồi chuyển sang UCS
+        raw = e.dxf.insert
+        wx, wy = wcs_to_ucs((raw.x, raw.y, 0.0), wcs2ucs)
+        inserts.append({"block_name": block_name, "x": wx, "y": wy})
 
     total = len(inserts)
     for i, ins in enumerate(inserts):

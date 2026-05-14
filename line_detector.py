@@ -103,8 +103,17 @@ IGNORE_BLOCKS = {
 }
 
 
-def collect_pipes(msp, layer_colors: dict) -> list:
-    """Thu thập tất cả đoạn đường ống với màu và tọa độ trung điểm."""
+def collect_pipes(msp, layer_colors: dict, wcs2ucs=None) -> list:
+    """Thu thập tất cả đoạn đường ống với màu và tọa độ trung điểm (UCS)."""
+    from ezdxf.math import Matrix44 as _M44
+    if wcs2ucs is None:
+        wcs2ucs = _M44()  # identity
+
+    def to_ucs(x, y):
+        from ezdxf.math import Vec3
+        p = wcs2ucs.transform(Vec3(x, y, 0))
+        return p.x, p.y
+
     pipes = []
     for e in msp:
         if e.dxftype() not in PIPE_TYPES:
@@ -113,17 +122,25 @@ def collect_pipes(msp, layer_colors: dict) -> list:
         line_info = color_to_line(rgb)
         if line_info["line_type"] == "Unknown":
             continue
-        # Lấy tọa độ đại diện
+        # Lấy tọa độ đại diện — luôn dùng WCS rồi convert sang UCS
         try:
             if e.dxftype() == "LINE":
                 s, end = e.dxf.start, e.dxf.end
-                cx, cy = (s.x + end.x) / 2, (s.y + end.y) / 2
+                cx, cy = to_ucs((s.x + end.x) / 2, (s.y + end.y) / 2)
             elif e.dxftype() == "LWPOLYLINE":
                 pts = list(e.get_points())
-                cx = sum(p[0] for p in pts) / len(pts)
-                cy = sum(p[1] for p in pts) / len(pts)
+                mx = sum(p[0] for p in pts) / len(pts)
+                my = sum(p[1] for p in pts) / len(pts)
+                cx, cy = to_ucs(mx, my)
+            elif e.dxftype() in ("POLYLINE", "SPLINE"):
+                pts = list(e.points())
+                if not pts:
+                    continue
+                cx, cy = to_ucs(pts[0].x, pts[0].y)
+            elif e.dxftype() == "ARC":
+                cx, cy = to_ucs(e.dxf.center.x, e.dxf.center.y)
             else:
-                cx, cy = e.dxf.insert.x, e.dxf.insert.y
+                continue
         except Exception:
             continue
         pipes.append({"x": cx, "y": cy, "rgb": rgb, "line_info": line_info})

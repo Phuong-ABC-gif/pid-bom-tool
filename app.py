@@ -96,9 +96,10 @@ if uploaded:
         # ── Bảng preview ──────────────────────────────────────────────────
         st.markdown(f"### 📋 Kết quả: **{len(items)} thiết bị** tìm thấy")
 
-        df = pd.DataFrame(items)[
+        # DataFrame đầy đủ gồm cả x, y để tra khi click
+        df_full = pd.DataFrame(items)[
             ["block_name", "display_name", "line_label", "group",
-             "size", "chung_loai", "vat_lieu", "tieu_chuan", "don_vi"]
+             "size", "chung_loai", "vat_lieu", "tieu_chuan", "don_vi", "x", "y"]
         ].rename(columns={
             "block_name":   "Block Name",
             "display_name": "Tên thiết bị",
@@ -109,7 +110,11 @@ if uploaded:
             "vat_lieu":     "Vật liệu",
             "tieu_chuan":   "Tiêu chuẩn",
             "don_vi":       "Đơn vị",
+            "x":            "X",
+            "y":            "Y",
         })
+        # df hiển thị (ẩn X, Y khỏi style nhưng giữ trong dataframe để tra)
+        df = df_full.drop(columns=["X", "Y"])
 
         # Tô màu theo nhóm
         def color_row(row):
@@ -119,15 +124,49 @@ if uploaded:
                 return ["background-color: #e8eeff"] * len(row)
             return [""] * len(row)
 
-        st.dataframe(
-            df.style.apply(color_row, axis=1),
+        st.markdown(f"### 📋 Kết quả: **{len(items)} thiết bị** tìm thấy")
+        st.caption("💡 Click vào dòng thiết bị để xem tọa độ trên bản vẽ")
+
+        # Placeholder tọa độ — hiện phía trên bảng, cập nhật khi click
+        coord_box = st.empty()
+
+        sel = st.dataframe(
+            df_full,
             use_container_width=True,
             height=420,
+            on_select="rerun",
+            selection_mode="single-row",
+            column_config={
+                "X": st.column_config.NumberColumn("X", format="%.2f", width="small"),
+                "Y": st.column_config.NumberColumn("Y", format="%.2f", width="small"),
+                "Nhóm": st.column_config.TextColumn("Nhóm", width="small"),
+                "Block Name": st.column_config.TextColumn("Block Name", width="medium"),
+                "Tên thiết bị": st.column_config.TextColumn("Tên thiết bị", width="large"),
+                "Line": st.column_config.TextColumn("Line", width="medium"),
+                "Size": st.column_config.TextColumn("Size", width="small"),
+                "Chủng loại": st.column_config.TextColumn("Chủng loại", width="medium"),
+                "Vật liệu": st.column_config.TextColumn("Vật liệu", width="medium"),
+                "Tiêu chuẩn": st.column_config.TextColumn("Tiêu chuẩn", width="small"),
+                "Đơn vị": st.column_config.TextColumn("Đơn vị", width="small"),
+            },
         )
+
+        # Xử lý row được chọn
+        selected_rows = sel.selection.rows if sel.selection else []
+        if selected_rows:
+            idx = selected_rows[0]
+            row = df_full.iloc[idx]
+            coord_box.info(
+                f"📍 **{row['Tên thiết bị']}** · Block: `{row['Block Name']}` · "
+                f"Line: {row['Line']} · Size: **{row['Size']}**\n\n"
+                f"**Tọa độ (UCS):** &nbsp; X = `{row['X']:.3f}` &nbsp;|&nbsp; Y = `{row['Y']:.3f}`"
+            )
+        else:
+            coord_box.empty()
 
         # ── Thống kê theo Line ────────────────────────────────────────────
         with st.expander("📊 Thống kê theo Line"):
-            stats = df.groupby(["Line", "Nhóm"]).size().reset_index(name="Số lượng")
+            stats = df_full.groupby(["Line", "Nhóm"]).size().reset_index(name="Số lượng")
             st.dataframe(stats, use_container_width=True)
 
         # ── Xuất BOM Excel ────────────────────────────────────────────────
@@ -153,10 +192,9 @@ if uploaded:
         st.divider()
         with st.expander("✏️ Chỉnh sửa thủ công trước khi xuất lại"):
             st.caption("Chỉnh sửa bảng bên dưới, sau đó bấm 'Xuất lại BOM' để tạo file mới.")
-            edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
+            edited_df = st.data_editor(df_full, use_container_width=True, num_rows="dynamic")
 
             if st.button("🔄 Xuất lại BOM từ bảng đã chỉnh sửa"):
-                # Chuyển đổi df ngược lại thành items
                 edited_items = []
                 for _, row in edited_df.iterrows():
                     edited_items.append({

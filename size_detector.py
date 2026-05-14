@@ -17,8 +17,16 @@ def _clean_text(raw: str) -> str:
     return raw.strip()
 
 
-def collect_size_annotations(msp) -> list:
-    """Thu thập tất cả TEXT/MTEXT có chứa DN hoặc inch annotation."""
+def collect_size_annotations(msp, wcs2ucs=None) -> list:
+    """Thu thập tất cả TEXT/MTEXT có chứa DN hoặc inch annotation (tọa độ UCS)."""
+    from ezdxf.math import Matrix44 as _M44, Vec3
+    if wcs2ucs is None:
+        wcs2ucs = _M44()
+
+    def to_ucs(x, y):
+        p = wcs2ucs.transform(Vec3(x, y, 0))
+        return p.x, p.y
+
     annotations = []
     for e in msp:
         if e.dxftype() not in ("TEXT", "MTEXT"):
@@ -27,25 +35,16 @@ def collect_size_annotations(msp) -> list:
             raw = e.text if e.dxftype() == "MTEXT" else e.dxf.text
             raw = _clean_text(raw)
             pos = e.dxf.insert
+            ux, uy = to_ucs(pos.x, pos.y)
 
-            # Tìm DN\d+
             m_dn = re.search(r"DN\s*(\d+)", raw, re.IGNORECASE)
             if m_dn:
-                annotations.append({
-                    "x": pos.x, "y": pos.y,
-                    "dn": f"DN{m_dn.group(1)}",
-                    "raw": raw,
-                })
+                annotations.append({"x": ux, "y": uy, "dn": f"DN{m_dn.group(1)}", "raw": raw})
                 continue
 
-            # Tìm inch: 1", 1.5", 2", 1/2" ...
             m_inch = re.search(r'(\d+(?:[./]\d+)?)\s*"', raw)
             if m_inch:
-                annotations.append({
-                    "x": pos.x, "y": pos.y,
-                    "dn": f'{m_inch.group(1)}"',
-                    "raw": raw,
-                })
+                annotations.append({"x": ux, "y": uy, "dn": f'{m_inch.group(1)}"', "raw": raw})
         except Exception:
             continue
     return annotations

@@ -9,6 +9,7 @@ Màu sắc:
   Data rows (thiết bị thực tế): KHÔNG nền, chữ đen, KHÔNG bold
 """
 import io
+import re
 from collections import defaultdict
 from datetime import date
 
@@ -164,6 +165,28 @@ def _build_footer(ws, row: int):
         row += 1
 
 
+def _size_sort_key(size_str: str) -> float:
+    """
+    Chuyển chuỗi size → số để sort giảm dần (lớn → nhỏ).
+    DN50 → 50.0 | 2" → 50.8 (2*25.4) | 1.5" → 38.1 | ? → -1
+    """
+    s = str(size_str).strip()
+    if s == "?":
+        return -1.0
+    # DN format
+    m = re.search(r"DN\s*(\d+(?:\.\d+)?)", s, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    # Inch format: 1", 1.5", 1/2"
+    m2 = re.search(r"(\d+)/(\d+)", s)
+    if m2:
+        return float(m2.group(1)) / float(m2.group(2)) * 25.4
+    m3 = re.search(r"(\d+(?:\.\d+)?)", s)
+    if m3:
+        return float(m3.group(1)) * 25.4
+    return -1.0
+
+
 def export_bom(items: list) -> bytes:
     """
     items: list of dict {
@@ -193,10 +216,17 @@ def export_bom(items: list) -> bytes:
         summary[key] += 1
 
     # Tái tổ chức: grouped_summary[line_type] = [(key, count), ...]
+    # Sắp xếp: theo tên thiết bị (asc) → size giảm dần (lớn → nhỏ)
     grouped = defaultdict(list)
     for key, count in summary.items():
         lt = key[2]
         grouped[lt].append((key, count))
+
+    for lt in grouped:
+        grouped[lt].sort(key=lambda kc: (
+            kc[0][0],                        # display_name asc
+            -_size_sort_key(kc[0][1]),       # size desc (âm để sort tăng = giảm thực)
+        ))
 
     major_idx = 0
     roman_idx = 0
