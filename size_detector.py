@@ -114,6 +114,9 @@ def collect_size_annotations(msp, wcs2ucs=None) -> list:
             ux, uy = to_ucs(pos.x, pos.y)
 
             size = parse_size(raw)
+            # Debug: log tất cả TEXT/MTEXT và kết quả parse
+            import sys
+            print(f"[SIZE_DEBUG] type={e.dxftype()} raw={repr(raw)[:80]} → parse={repr(size)}", file=sys.stderr)
             if size:
                 annotations.append({"x": ux, "y": uy, "dn": size, "raw": raw})
         except Exception:

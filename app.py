@@ -69,7 +69,13 @@ if uploaded:
             _p.progress(min(pct, 1.0))
 
         try:
+            import io as _io, sys as _sys
+            _old_stderr = _sys.stderr
+            _sys.stderr = _debug_buf = _io.StringIO()
             items, warnings = process_dxf(tmp_path, _cb)
+            _sys.stderr = _old_stderr
+            debug_lines = _debug_buf.getvalue().splitlines()
+            st.session_state["debug_log"] = debug_lines
             st.session_state["items"]    = items
             st.session_state["warnings"] = warnings
         except Exception as err:
@@ -95,6 +101,23 @@ if "items" in st.session_state:
         with st.expander(f"⚠️ {len(warnings)} cảnh báo", expanded=False):
             for w in warnings:
                 st.markdown(f"- {w}")
+
+    # Debug: raw TEXT/MTEXT từ DXF
+    debug_log = st.session_state.get("debug_log", [])
+    if debug_log:
+        with st.expander(f"🔍 Debug: {len(debug_log)} annotation TEXT/MTEXT trong DXF", expanded=False):
+            st.caption("Dùng để kiểm tra format size thực tế trong bản vẽ")
+            found = [l for l in debug_log if "parse=" in l and "None" not in l]
+            missed = [l for l in debug_log if "→ parse=None" in l]
+            st.markdown(f"**Nhận diện được:** {len(found)} &nbsp;|&nbsp; **Không nhận:** {len(missed)}")
+            if missed:
+                st.markdown("**Annotation không nhận diện được size (raw text):**")
+                for l in missed[:50]:
+                    st.code(l, language=None)
+            if found:
+                st.markdown("**Annotation nhận diện được:**")
+                for l in found[:50]:
+                    st.code(l, language=None)
 
     # Build DataFrame (1 lần)
     df = (
